@@ -12,10 +12,13 @@
 mod engine;
 mod event;
 pub mod fakes;
+pub mod git;
 mod ids;
 mod ports;
+mod worktree;
 
 pub use engine::Engine;
-pub use event::{Effect, Event};
+pub use event::{Effect, Event, WorktreeSpawn};
 pub use ids::{AgentWorktreeId, AuthoringSessionId};
 pub use ports::{AgentPort, GitPort, RenderModel, UiPort};
+pub use worktree::AgentWorktree;
