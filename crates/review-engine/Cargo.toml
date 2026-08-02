@@ -1,0 +1,9 @@
+[package]
+name = "review-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Headless Review Loop Engine: event-in/effect-out core of the Agent Review Loop"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
