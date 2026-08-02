@@ -34,6 +34,6 @@ fn fakes_are_scriptable_from_tests() {
     );
 
     let mut git = FakeGitPort::new();
-    let worktree = git.create_worktree(&session);
+    let worktree = git.create_worktree(&session).unwrap();
     assert_eq!(git.created(), [worktree]);
 }
