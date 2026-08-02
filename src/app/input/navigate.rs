@@ -109,6 +109,11 @@ impl App {
             self.cancel_copy_mode_if_active();
             self.launch_focused_scrollback_editor();
             finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
+        } else if action == NavigateAction::OpenReview {
+            let previous_mode = self.state.mode;
+            self.cancel_copy_mode_if_active();
+            self.launch_focused_review_pane();
+            finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
         } else if action == NavigateAction::CopyMode {
             self.cancel_copy_mode_if_active();
             self.execute_tui_navigate_action(action, ActionContext::Prefix);
@@ -162,6 +167,8 @@ impl App {
         if let Some(action) = navigate_mode_non_indexed_action_for_key(&self.state, &raw_key) {
             if action == NavigateAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
+            } else if action == NavigateAction::OpenReview {
+                self.launch_focused_review_pane();
             } else {
                 self.execute_tui_navigate_action(action, ActionContext::Navigate);
             }
@@ -377,6 +384,7 @@ impl App {
                 }
             }
             NavigateAction::EditScrollback => {}
+            NavigateAction::OpenReview => {}
             NavigateAction::CopyMode => self.state.enter_copy_mode(&self.terminal_runtimes),
             NavigateAction::Zoom => {
                 self.zoom_focused_pane_via_api();
@@ -965,6 +973,65 @@ impl App {
         Ok(())
     }
 
+    pub(crate) fn launch_focused_review_pane(&mut self) {
+        let previous_toast = self.state.toast.clone();
+        match self.open_focused_review_pane() {
+            Ok(()) => self.sync_toast_deadline(previous_toast),
+            Err(err) => {
+                self.state.toast = Some(crate::app::state::ToastNotification {
+                    kind: crate::app::state::ToastKind::NeedsAttention,
+                    title: "open review failed".to_string(),
+                    context: err.to_string(),
+                    position: None,
+                    target: None,
+                });
+                self.sync_toast_deadline(previous_toast);
+            }
+        }
+    }
+
+    /// Open the Review Pane on the focused pane's Agent Worktree: an
+    /// overlay pane running `herdr review-pane` in the pane's cwd. The
+    /// review process outlives detach/reattach with the rest of the PTYs.
+    fn open_focused_review_pane(&mut self) -> std::io::Result<()> {
+        let ws_idx = self
+            .state
+            .active
+            .ok_or_else(|| std::io::Error::other("no active workspace"))?;
+        let ws = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .ok_or_else(|| std::io::Error::other("active workspace disappeared"))?;
+        let pane_id = ws
+            .focused_pane_id()
+            .ok_or_else(|| std::io::Error::other("no focused pane"))?;
+        let worktree = ws
+            .active_tab()
+            .and_then(|tab| {
+                tab.cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
+            })
+            .ok_or_else(|| std::io::Error::other("focused pane has no working directory"))?;
+
+        let herdr = std::env::current_exe()?;
+        let argv = vec![
+            herdr.to_string_lossy().into_owned(),
+            "review-pane".to_string(),
+            "--worktree".to_string(),
+            worktree.to_string_lossy().into_owned(),
+        ];
+        let (env, _) = self.custom_command_env();
+        let (_, new_pane) = self.spawn_overlay_argv_command(&argv, Some(worktree), env, vec![])?;
+        self.terminal_runtimes
+            .insert(new_pane.terminal.id.clone(), new_pane.runtime);
+        self.state
+            .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
+        self.state
+            .terminals
+            .insert(new_pane.terminal.id.clone(), new_pane.terminal);
+        Ok(())
+    }
+
     fn spawn_pane_command(
         &mut self,
         command: &str,
@@ -1361,6 +1428,7 @@ pub(crate) enum NavigateAction {
     SplitHorizontal,
     ClosePane,
     EditScrollback,
+    OpenReview,
     CopyMode,
     Zoom,
     EnterResizeMode,
@@ -1491,6 +1559,7 @@ fn non_indexed_action_for_key(
         (&kb.close_tab, NavigateAction::CloseTab),
         (&kb.rename_pane, NavigateAction::RenamePane),
         (&kb.edit_scrollback, NavigateAction::EditScrollback),
+        (&kb.open_review, NavigateAction::OpenReview),
         (&kb.copy_mode, NavigateAction::CopyMode),
         (&kb.focus_pane_left, NavigateAction::FocusPaneLeft),
         (&kb.focus_pane_down, NavigateAction::FocusPaneDown),
@@ -1733,6 +1802,7 @@ pub(super) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::EditScrollback => {}
+        NavigateAction::OpenReview => {}
         NavigateAction::CopyMode => state.enter_copy_mode(terminal_runtimes),
         NavigateAction::Zoom => {
             state.toggle_zoom();
@@ -3416,6 +3486,71 @@ navigate_pane_down = "ctrl+j"
         );
 
         let _ = std::fs::remove_file(output_path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_review_key_opens_a_review_pane_scoped_to_the_focused_panes_worktree() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let (workspace, terminal, runtime) = Workspace::new(
+            std::env::current_dir().unwrap_or_else(|_| "/".into()),
+            24,
+            80,
+            app.state.pane_scrollback_limit_bytes,
+            app.state.host_terminal_theme,
+            crate::pane::PaneShellConfig::new(&app.state.default_shell, app.state.shell_mode),
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        )
+        .expect("workspace should spawn");
+        let root_pane = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.terminal_runtimes.insert(terminal.id.clone(), runtime);
+        app.state.terminals.insert(terminal.id.clone(), terminal);
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.keybinds.open_review = crate::config::ActionKeybinds::prefix("g");
+
+        app.handle_key(TerminalKey::new(
+            app.state.prefix_code,
+            app.state.prefix_mods,
+        ))
+        .await;
+        app.handle_key(TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty()))
+            .await;
+
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        let overlay_pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        assert_ne!(overlay_pane, root_pane);
+        let review_argv = app
+            .state
+            .terminals
+            .values()
+            .find_map(|terminal| {
+                terminal
+                    .launch_argv
+                    .as_ref()
+                    .filter(|argv| argv.iter().any(|arg| arg == "review-pane"))
+            })
+            .expect("a pane should be running the review-pane subcommand");
+        assert!(
+            review_argv.iter().any(|arg| arg == "--worktree"),
+            "review pane must be scoped to a worktree, got {review_argv:?}"
+        );
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
     }
 
     #[test]

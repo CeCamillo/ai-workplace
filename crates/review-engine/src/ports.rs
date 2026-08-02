@@ -1,4 +1,6 @@
+use crate::diff::Changeset;
 use crate::ids::AuthoringSessionId;
+use crate::review::ReviewView;
 use crate::worktree::AgentWorktree;
 
 /// The Harness Adapter seam: how the engine talks to an agent product
@@ -25,6 +27,10 @@ pub trait GitPort {
     /// Reset the worktree clean, destroying the uncommitted changeset. The
     /// worktree and branch survive.
     fn discard_worktree(&mut self, worktree: &AgentWorktree) -> Result<(), String>;
+
+    /// The worktree's current changeset (everything the agent changed and
+    /// has not committed), as a parsed diff.
+    fn changeset_diff(&mut self, worktree: &AgentWorktree) -> Result<Changeset, String>;
 }
 
 /// What the Review Pane should draw. The engine owns this state; the pane
@@ -33,6 +39,8 @@ pub trait GitPort {
 pub struct RenderModel {
     /// Sessions whose changesets are waiting for a human.
     pub ready_for_review: Vec<AuthoringSessionId>,
+    /// The open Review Panes, one view per reviewing session.
+    pub reviews: Vec<ReviewView>,
 }
 
 /// The declarative-render seam consumed by the Review Pane TUI.

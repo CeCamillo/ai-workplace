@@ -1,0 +1,332 @@
+//! Read-only review state: the open Review Pane's cursor and scroll, and
+//! the reviewed-marks that outlive it. Marks are keyed by Agent Worktree
+//! (not by pane) so they survive close/reopen and detach/reattach.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::diff::{Changeset, DiffLineKind};
+use crate::ids::{AgentWorktreeId, AuthoringSessionId};
+use crate::worktree::AgentWorktree;
+
+/// A vim motion inside the Review Pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewMotion {
+    LineDown,
+    LineUp,
+    HalfPageDown,
+    HalfPageUp,
+    NextHunk,
+    PrevHunk,
+    NextFile,
+    PrevFile,
+}
+
+/// What a reviewed-mark toggle applies to: the hunk under the cursor, or
+/// the whole file under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkTarget {
+    Hunk,
+    File,
+}
+
+/// Reviewed-marks for one Agent Worktree. A file counts as reviewed when
+/// explicitly marked or when every one of its hunks is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReviewedMarks {
+    /// `(file path, hunk index)` pairs marked reviewed.
+    pub hunks: HashSet<(String, usize)>,
+    /// Files explicitly marked reviewed (covers hunkless files, e.g. binary).
+    pub files: HashSet<String>,
+}
+
+/// All reviewed-marks, keyed by Agent Worktree — the unit the host
+/// persists across server restarts.
+pub type ReviewedMarksSnapshot = HashMap<AgentWorktreeId, ReviewedMarks>;
+
+impl ReviewedMarks {
+    fn file_reviewed(&self, path: &str, hunk_count: usize) -> bool {
+        self.files.contains(path)
+            || (hunk_count > 0
+                && (0..hunk_count).all(|i| self.hunks.contains(&(path.to_string(), i))))
+    }
+
+    fn toggle_file(&mut self, path: &str, hunk_count: usize) {
+        if self.file_reviewed(path, hunk_count) {
+            self.files.remove(path);
+            self.hunks.retain(|(p, _)| p != path);
+        } else {
+            self.files.insert(path.to_string());
+            for i in 0..hunk_count {
+                self.hunks.insert((path.to_string(), i));
+            }
+        }
+    }
+
+    fn toggle_hunk(&mut self, path: &str, hunk: usize) {
+        let key = (path.to_string(), hunk);
+        if !self.hunks.remove(&key) {
+            self.hunks.insert(key);
+        } else {
+            // A partially-reviewed file is no longer wholly reviewed.
+            self.files.remove(path);
+        }
+    }
+}
+
+/// One open Review Pane: the changeset snapshot it renders plus cursor and
+/// scroll. Marks live outside this, keyed by worktree.
+#[derive(Debug)]
+pub struct ReviewState {
+    pub worktree: AgentWorktree,
+    pub changeset: Changeset,
+    pub cursor: usize,
+    pub scroll_top: usize,
+    pub viewport_rows: usize,
+}
+
+impl ReviewState {
+    pub fn new(worktree: AgentWorktree, changeset: Changeset) -> Self {
+        Self {
+            worktree,
+            changeset,
+            cursor: 0,
+            scroll_top: 0,
+            viewport_rows: 0,
+        }
+    }
+
+    fn stream_positions(&self) -> Vec<StreamPosition> {
+        let mut rows = Vec::new();
+        for (file_idx, file) in self.changeset.files.iter().enumerate() {
+            rows.push(StreamPosition::FileHeader { file: file_idx });
+            for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+                rows.push(StreamPosition::HunkHeader {
+                    file: file_idx,
+                    hunk: hunk_idx,
+                });
+                for _ in &hunk.lines {
+                    rows.push(StreamPosition::Line {
+                        file: file_idx,
+                        hunk: hunk_idx,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    pub fn apply_motion(&mut self, motion: ReviewMotion) {
+        let positions = self.stream_positions();
+        if positions.is_empty() {
+            return;
+        }
+        let last = positions.len() - 1;
+        let half_page = (self.viewport_rows / 2).max(1);
+        self.cursor = match motion {
+            ReviewMotion::LineDown => (self.cursor + 1).min(last),
+            ReviewMotion::LineUp => self.cursor.saturating_sub(1),
+            ReviewMotion::HalfPageDown => (self.cursor + half_page).min(last),
+            ReviewMotion::HalfPageUp => self.cursor.saturating_sub(half_page),
+            ReviewMotion::NextHunk => next_matching(&positions, self.cursor, is_hunk_header),
+            ReviewMotion::PrevHunk => prev_matching(&positions, self.cursor, is_hunk_header),
+            ReviewMotion::NextFile => next_matching(&positions, self.cursor, is_file_header),
+            ReviewMotion::PrevFile => prev_matching(&positions, self.cursor, is_file_header),
+        };
+        self.follow_cursor();
+    }
+
+    pub fn resize_viewport(&mut self, rows: usize) {
+        self.viewport_rows = rows;
+        self.follow_cursor();
+    }
+
+    /// Keep the cursor inside the viewport window.
+    fn follow_cursor(&mut self) {
+        if self.viewport_rows == 0 {
+            return;
+        }
+        if self.cursor < self.scroll_top {
+            self.scroll_top = self.cursor;
+        } else if self.cursor >= self.scroll_top + self.viewport_rows {
+            self.scroll_top = self.cursor + 1 - self.viewport_rows;
+        }
+    }
+
+    /// The `(path, hunk index)` under the cursor, if the cursor is on or
+    /// inside a hunk.
+    fn hunk_under_cursor(&self) -> Option<(String, usize)> {
+        match self.stream_positions().get(self.cursor)? {
+            StreamPosition::HunkHeader { file, hunk } | StreamPosition::Line { file, hunk } => {
+                Some((self.changeset.files[*file].path.clone(), *hunk))
+            }
+            StreamPosition::FileHeader { .. } => None,
+        }
+    }
+
+    /// The file under the cursor (any row belongs to exactly one file).
+    fn file_under_cursor(&self) -> Option<usize> {
+        match self.stream_positions().get(self.cursor)? {
+            StreamPosition::FileHeader { file }
+            | StreamPosition::HunkHeader { file, .. }
+            | StreamPosition::Line { file, .. } => Some(*file),
+        }
+    }
+
+    pub fn toggle_mark(&self, marks: &mut ReviewedMarks, target: MarkTarget) {
+        match target {
+            MarkTarget::Hunk => {
+                if let Some((path, hunk)) = self.hunk_under_cursor() {
+                    marks.toggle_hunk(&path, hunk);
+                }
+            }
+            MarkTarget::File => {
+                if let Some(file) = self.file_under_cursor() {
+                    let file = &self.changeset.files[file];
+                    marks.toggle_file(&file.path, file.hunks.len());
+                }
+            }
+        }
+    }
+
+    /// Build what the Review Pane draws.
+    pub fn view(&self, session: &AuthoringSessionId, marks: &ReviewedMarks) -> ReviewView {
+        let files = self
+            .changeset
+            .files
+            .iter()
+            .map(|file| {
+                let hunks_reviewed = (0..file.hunks.len())
+                    .filter(|i| marks.hunks.contains(&(file.path.clone(), *i)))
+                    .count();
+                FileSummary {
+                    path: file.path.clone(),
+                    reviewed: marks.file_reviewed(&file.path, file.hunks.len()),
+                    hunks_total: file.hunks.len(),
+                    hunks_reviewed,
+                }
+            })
+            .collect();
+        let mut stream = Vec::new();
+        for (file_idx, file) in self.changeset.files.iter().enumerate() {
+            stream.push(StreamRow::FileHeader {
+                file: file_idx,
+                path: file.path.clone(),
+                reviewed: marks.file_reviewed(&file.path, file.hunks.len()),
+            });
+            for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+                stream.push(StreamRow::HunkHeader {
+                    file: file_idx,
+                    hunk: hunk_idx,
+                    header: hunk.header.clone(),
+                    reviewed: marks.hunks.contains(&(file.path.clone(), hunk_idx)),
+                });
+                for line in &hunk.lines {
+                    stream.push(StreamRow::Line {
+                        kind: line.kind,
+                        content: line.content.clone(),
+                    });
+                }
+            }
+        }
+        ReviewView {
+            session: session.clone(),
+            worktree: self.worktree.id.clone(),
+            files,
+            stream,
+            cursor: self.cursor,
+            cursor_file: self.file_under_cursor(),
+            scroll_top: self.scroll_top,
+            viewport_rows: self.viewport_rows,
+        }
+    }
+}
+
+/// Row identity used for cursor motions; parallel to [`StreamRow`] without
+/// the display payload.
+enum StreamPosition {
+    FileHeader { file: usize },
+    HunkHeader { file: usize, hunk: usize },
+    Line { file: usize, hunk: usize },
+}
+
+fn is_hunk_header(row: &StreamPosition) -> bool {
+    matches!(row, StreamPosition::HunkHeader { .. })
+}
+
+fn is_file_header(row: &StreamPosition) -> bool {
+    matches!(row, StreamPosition::FileHeader { .. })
+}
+
+fn next_matching(
+    positions: &[StreamPosition],
+    cursor: usize,
+    matches: fn(&StreamPosition) -> bool,
+) -> usize {
+    positions
+        .iter()
+        .enumerate()
+        .skip(cursor + 1)
+        .find(|(_, row)| matches(row))
+        .map(|(idx, _)| idx)
+        .unwrap_or(cursor)
+}
+
+fn prev_matching(
+    positions: &[StreamPosition],
+    cursor: usize,
+    matches: fn(&StreamPosition) -> bool,
+) -> usize {
+    positions
+        .iter()
+        .enumerate()
+        .take(cursor)
+        .rev()
+        .find(|(_, row)| matches(row))
+        .map(|(idx, _)| idx)
+        .unwrap_or(cursor)
+}
+
+/// What the Review Pane draws: file sidebar, continuous multi-file stream,
+/// cursor and scroll. The engine owns this; the pane only renders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewView {
+    pub session: AuthoringSessionId,
+    pub worktree: AgentWorktreeId,
+    pub files: Vec<FileSummary>,
+    pub stream: Vec<StreamRow>,
+    pub cursor: usize,
+    /// Index into `files` of the file the cursor row belongs to, so the
+    /// pane can highlight the sidebar without re-deriving it.
+    pub cursor_file: Option<usize>,
+    pub scroll_top: usize,
+    pub viewport_rows: usize,
+}
+
+/// One file sidebar row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSummary {
+    pub path: String,
+    pub reviewed: bool,
+    pub hunks_total: usize,
+    pub hunks_reviewed: usize,
+}
+
+/// One row of the continuous diff stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamRow {
+    FileHeader {
+        file: usize,
+        path: String,
+        reviewed: bool,
+    },
+    HunkHeader {
+        file: usize,
+        hunk: usize,
+        header: String,
+        reviewed: bool,
+    },
+    Line {
+        kind: DiffLineKind,
+        content: String,
+    },
+}

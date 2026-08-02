@@ -687,6 +687,7 @@ dependencies = [
  "portable-pty",
  "ratatui",
  "regex",
+ "review-engine",
  "schemars",
  "serde",
  "serde_ignored",

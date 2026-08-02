@@ -416,6 +416,12 @@
           "description": "Open the focused pane scrollback in $EDITOR."
         },
         {
+          "key": "keys.open_review",
+          "type": "keybinding",
+          "default": "\"prefix+i\"",
+          "description": "Open the Review Pane on the focused pane's Agent Worktree."
+        },
+        {
           "key": "keys.copy_mode",
           "type": "keybinding",
           "default": "\"prefix+[\"",

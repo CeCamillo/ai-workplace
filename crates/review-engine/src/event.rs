@@ -1,4 +1,5 @@
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
+use crate::review::{MarkTarget, ReviewMotion};
 use crate::worktree::AgentWorktree;
 
 /// How a spawned agent pane gets its Agent Worktree.
@@ -23,6 +24,27 @@ pub enum Event {
     AgentFinished { session: AuthoringSessionId },
     /// The human discarded the session's changeset.
     ChangesetDiscarded { session: AuthoringSessionId },
+    /// The human pressed the review keybind on a pane; open the Review Pane
+    /// on that pane's Agent Worktree.
+    ReviewRequested { session: AuthoringSessionId },
+    /// The human closed the session's Review Pane.
+    ReviewClosed { session: AuthoringSessionId },
+    /// A vim motion inside the session's Review Pane.
+    ReviewNavigated {
+        session: AuthoringSessionId,
+        motion: ReviewMotion,
+    },
+    /// The Review Pane's stream viewport is now `rows` tall (initial layout
+    /// or a resize); half-page motions and scroll-follow depend on it.
+    ReviewViewportResized {
+        session: AuthoringSessionId,
+        rows: usize,
+    },
+    /// The human toggled a reviewed-mark at the cursor.
+    ReviewMarkToggled {
+        session: AuthoringSessionId,
+        target: MarkTarget,
+    },
 }
 
 /// Something the engine wants the host to do in response to an [`Event`].
@@ -45,6 +67,17 @@ pub enum Effect {
     },
     /// A worktree operation failed; surface the message to the human.
     WorktreeOperationFailed {
+        session: AuthoringSessionId,
+        message: String,
+    },
+    /// The review is open: mount a Review Pane for `session` and draw its
+    /// [`crate::ReviewView`] from the render model.
+    ReviewPaneOpened {
+        session: AuthoringSessionId,
+        worktree: AgentWorktreeId,
+    },
+    /// The review could not open; surface the message to the human.
+    ReviewOpenFailed {
         session: AuthoringSessionId,
         message: String,
     },

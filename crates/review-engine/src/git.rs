@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::diff::{parse_unified_diff, Changeset};
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
 use crate::ports::GitPort;
 use crate::worktree::AgentWorktree;
@@ -60,7 +61,12 @@ impl SystemGitPort {
     fn branch_exists(&self, branch: &str) -> bool {
         self.git(
             &self.repo_root,
-            &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
         )
         .is_ok()
     }
@@ -82,7 +88,13 @@ fn path_to_str(path: &Path) -> Result<&str, String> {
 /// herdr's own branch-to-path slugging.
 fn path_slug(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -122,7 +134,10 @@ impl GitPort for SystemGitPort {
                     return Err(format!("branch '{branch}' does not exist"));
                 }
                 let path = self.worktrees_root.join(path_slug(branch));
-                self.git(&self.repo_root, &["worktree", "add", path_to_str(&path)?, branch])?;
+                self.git(
+                    &self.repo_root,
+                    &["worktree", "add", path_to_str(&path)?, branch],
+                )?;
                 path
             }
         };
@@ -137,5 +152,13 @@ impl GitPort for SystemGitPort {
         self.git(&worktree.path, &["reset", "--hard"])?;
         self.git(&worktree.path, &["clean", "-fd"])?;
         Ok(())
+    }
+
+    fn changeset_diff(&mut self, worktree: &AgentWorktree) -> Result<Changeset, String> {
+        // Intent-to-add makes files the agent created visible to `diff HEAD`
+        // without staging their content; discard's `reset --hard` undoes it.
+        self.git(&worktree.path, &["add", "--intent-to-add", "--all"])?;
+        let text = self.git(&worktree.path, &["diff", "HEAD"])?;
+        Ok(parse_unified_diff(&text))
     }
 }
