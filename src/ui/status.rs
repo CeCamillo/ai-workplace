@@ -207,7 +207,9 @@ pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
         (AgentState::Blocked, _) => "blocked",
         (AgentState::Working, _) => "working",
-        (AgentState::Idle, false) => "done",
+        // An agent that finished work is Ready-for-Review: the changeset is
+        // waiting for a human, one keybind away from the Review Pane.
+        (AgentState::Idle, false) => "ready for review",
         (AgentState::Idle, true) => "idle",
         (AgentState::Unknown, _) => "idle",
     }

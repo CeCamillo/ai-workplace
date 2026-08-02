@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::diff::Changeset;
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
 use crate::ports::{AgentPort, GitPort, RenderModel, UiPort};
 use crate::worktree::AgentWorktree;
@@ -48,6 +49,7 @@ pub struct FakeGitPort {
     existing: HashMap<String, AgentWorktree>,
     created: Vec<AgentWorktree>,
     discarded: Vec<AgentWorktree>,
+    changeset: Changeset,
     fail_next: Option<String>,
 }
 
@@ -64,6 +66,12 @@ impl FakeGitPort {
     /// Make the next git operation fail with this message.
     pub fn fail_next(&mut self, message: String) {
         self.fail_next = Some(message);
+    }
+
+    /// Script the changeset every worktree's [`GitPort::changeset_diff`]
+    /// returns.
+    pub fn set_changeset(&mut self, changeset: Changeset) {
+        self.changeset = changeset;
     }
 
     pub fn created(&self) -> &[AgentWorktree] {
@@ -110,6 +118,13 @@ impl GitPort for FakeGitPort {
         }
         self.discarded.push(worktree.clone());
         Ok(())
+    }
+
+    fn changeset_diff(&mut self, _worktree: &AgentWorktree) -> Result<Changeset, String> {
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        Ok(self.changeset.clone())
     }
 }
 

@@ -86,6 +86,8 @@ impl App {
             );
             if action == super::navigate::NavigateAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
+            } else if action == super::navigate::NavigateAction::OpenReview {
+                self.launch_focused_review_pane();
             } else {
                 self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
             }

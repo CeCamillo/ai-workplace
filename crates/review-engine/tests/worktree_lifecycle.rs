@@ -7,9 +7,7 @@ use review_engine::{
     AgentWorktree, AgentWorktreeId, AuthoringSessionId, Effect, Engine, Event, WorktreeSpawn,
 };
 
-fn engine_with_git(
-    git: FakeGitPort,
-) -> Engine<FakeAgentPort, FakeGitPort, FakeUiPort> {
+fn engine_with_git(git: FakeGitPort) -> Engine<FakeAgentPort, FakeGitPort, FakeUiPort> {
     Engine::new(FakeAgentPort::new(), git, FakeUiPort::new())
 }
 
