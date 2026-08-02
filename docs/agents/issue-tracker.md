@@ -13,7 +13,7 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
 
-Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
+**Always target this fork, never upstream.** This repo has an `upstream` remote pointing at `herdrdev/herdr`, and `gh` may resolve it as the default repo. The default is pinned via `gh repo set-default CeCamillo/ai-workplace`; if an issue command ever resolves to `herdrdev/herdr`, stop and re-pin. When in doubt, pass `-R CeCamillo/ai-workplace` explicitly. Never create, comment on, label, or close issues in `herdrdev/herdr`.
 
 ## Pull requests as a triage surface
 
