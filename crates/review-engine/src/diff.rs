@@ -23,6 +23,25 @@ pub struct Hunk {
     pub lines: Vec<DiffLine>,
 }
 
+impl Hunk {
+    /// The post-image `(start, count)` range from the `@@ -a,b +c,d @@`
+    /// header; `+c` without a count means one line. `None` when the header
+    /// is not in git's shape.
+    pub fn post_image_range(&self) -> Option<(usize, usize)> {
+        let plus = self
+            .header
+            .split_whitespace()
+            .find(|f| f.starts_with('+'))?;
+        let mut parts = plus[1..].splitn(2, ',');
+        let start = parts.next()?.parse().ok()?;
+        let count = match parts.next() {
+            Some(count) => count.parse().ok()?,
+            None => 1,
+        };
+        Some((start, count))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
@@ -138,6 +157,26 @@ index 000..333
         assert_eq!(new.path, "src/new.rs");
         assert_eq!(new.hunks.len(), 1);
         assert_eq!(new.hunks[0].lines.len(), 2, "no-newline marker is skipped");
+    }
+
+    #[test]
+    fn hunk_post_image_ranges_come_from_the_header() {
+        let changeset = parse_unified_diff(SAMPLE);
+        let lib = &changeset.files[0];
+        assert_eq!(lib.hunks[0].post_image_range(), Some((1, 4)));
+        assert_eq!(lib.hunks[1].post_image_range(), Some((11, 2)));
+
+        let countless = Hunk {
+            header: "@@ -3 +7 @@ fn context()".to_string(),
+            lines: vec![],
+        };
+        assert_eq!(countless.post_image_range(), Some((7, 1)));
+
+        let mangled = Hunk {
+            header: "not a header".to_string(),
+            lines: vec![],
+        };
+        assert_eq!(mangled.post_image_range(), None);
     }
 
     #[test]

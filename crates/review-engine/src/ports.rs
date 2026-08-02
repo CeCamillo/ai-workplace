@@ -1,3 +1,4 @@
+use crate::annotation::Annotation;
 use crate::diff::Changeset;
 use crate::ids::AuthoringSessionId;
 use crate::review::ReviewView;
@@ -12,6 +13,10 @@ pub trait AgentPort {
     /// Deliver a structured instruction set (e.g. a submitted Review) to the
     /// session.
     fn deliver_instructions(&mut self, session: &AuthoringSessionId, instructions: &str);
+
+    /// Drain the Annotations the adapter captured from this session since
+    /// the last drain. The engine persists them; the adapter must not.
+    fn take_annotations(&mut self, session: &AuthoringSessionId) -> Vec<Annotation>;
 }
 
 /// Git operations on Agent Worktrees. All fallible: real git can refuse any
@@ -31,6 +36,10 @@ pub trait GitPort {
     /// The worktree's current changeset (everything the agent changed and
     /// has not committed), as a parsed diff.
     fn changeset_diff(&mut self, worktree: &AgentWorktree) -> Result<Changeset, String>;
+
+    /// The commit the uncommitted changeset sits on — the commit-range key
+    /// Annotations are persisted under.
+    fn changeset_base(&mut self, worktree: &AgentWorktree) -> Result<String, String>;
 }
 
 /// What the Review Pane should draw. The engine owns this state; the pane

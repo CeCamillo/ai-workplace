@@ -1,5 +1,5 @@
 mod actions;
-mod claude_settings;
+pub(crate) mod claude_settings;
 mod command;
 mod config_edit;
 mod env;
@@ -10,11 +10,15 @@ mod types;
 mod version;
 
 pub(crate) use actions::{install_target, uninstall_target};
+// The Claude Code Harness Adapter (`herdr annotate install-hook`) reuses
+// these to register its own hook without touching the claude target.
+pub(crate) use env::claude_dir;
 #[cfg(test)]
 pub(crate) use env::integration_env_lock;
 pub(crate) use env::{
     apply_pane_base_env, HERDR_PANE_ID_ENV_VAR, HERDR_TAB_ID_ENV_VAR, HERDR_WORKSPACE_ID_ENV_VAR,
 };
+pub(crate) use file_ops::make_executable;
 pub(crate) use registry::{
     installed_integration_statuses, integration_recommendations, integration_target_label,
     print_outdated_update_notice,

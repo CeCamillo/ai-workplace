@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::annotation::AnnotationsSnapshot;
 use crate::event::{Effect, Event, WorktreeSpawn};
 use crate::ids::AuthoringSessionId;
 use crate::ports::{AgentPort, GitPort, RenderModel, UiPort};
@@ -8,9 +9,6 @@ use crate::worktree::AgentWorktree;
 
 /// The event-in/effect-out core of the Agent Review Loop.
 pub struct Engine<A: AgentPort, G: GitPort, U: UiPort> {
-    // Unused until later loop stages (Hunk Conversations, batched Reviews)
-    // land behind this seam.
-    #[allow(dead_code)]
     agent: A,
     git: G,
     ui: U,
@@ -22,6 +20,9 @@ pub struct Engine<A: AgentPort, G: GitPort, U: UiPort> {
     /// Reviewed-marks, keyed by Agent Worktree so they outlive any one
     /// Review Pane (close/reopen, detach/reattach).
     marks: ReviewedMarksSnapshot,
+    /// Annotations, keyed by Agent Worktree and commit range so they outlive
+    /// the Authoring Session that emitted them (ADR-0003).
+    annotations: AnnotationsSnapshot,
 }
 
 impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
@@ -34,7 +35,16 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
             worktrees: HashMap::new(),
             reviews: Vec::new(),
             marks: ReviewedMarksSnapshot::new(),
+            annotations: AnnotationsSnapshot::new(),
         }
+    }
+
+    pub fn agent(&self) -> &A {
+        &self.agent
+    }
+
+    pub fn agent_mut(&mut self) -> &mut A {
+        &mut self.agent
     }
 
     pub fn git(&self) -> &G {
@@ -59,6 +69,16 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
         self.marks = snapshot;
     }
 
+    /// All Annotations, for the host to persist in the product state store.
+    pub fn annotations_snapshot(&self) -> AnnotationsSnapshot {
+        self.annotations.clone()
+    }
+
+    /// Restore host-persisted Annotations (e.g. on server start).
+    pub fn restore_annotations(&mut self, snapshot: AnnotationsSnapshot) {
+        self.annotations = snapshot;
+    }
+
     /// Advance the loop: apply one event, re-render, and return the effects
     /// the host must carry out.
     pub fn handle_event(&mut self, event: Event) -> Vec<Effect> {
@@ -68,6 +88,7 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
                 self.model.ready_for_review.push(session.clone());
                 vec![Effect::ReadyForReview { session }]
             }
+            Event::AnnotationsEmitted { session } => self.ingest_annotations(session),
             Event::ChangesetDiscarded { session } => self.discard_changeset(session),
             Event::ReviewRequested { session } => self.open_review(session),
             Event::ReviewClosed { session } => {
@@ -116,14 +137,72 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
             Ok(changeset) => changeset,
             Err(message) => return vec![Effect::ReviewOpenFailed { session, message }],
         };
+        let base = match self.git.changeset_base(&worktree) {
+            Ok(base) => base,
+            Err(message) => return vec![Effect::ReviewOpenFailed { session, message }],
+        };
+        // Annotations still sitting in the adapter belong to this review.
+        self.drain_annotations(&session, &worktree, &base);
+        let annotations = self
+            .annotations
+            .get(&worktree.id)
+            .and_then(|ranges| ranges.get(&base))
+            .cloned()
+            .unwrap_or_default();
         let worktree_id = worktree.id.clone();
         self.reviews.retain(|(s, _)| *s != session);
-        self.reviews
-            .push((session.clone(), ReviewState::new(worktree, changeset)));
+        self.reviews.push((
+            session.clone(),
+            ReviewState::new(worktree, changeset, base, annotations),
+        ));
         vec![Effect::ReviewPaneOpened {
             session,
             worktree: worktree_id,
         }]
+    }
+
+    fn ingest_annotations(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
+        let Some(worktree) = self.worktrees.get(&session).cloned() else {
+            return vec![Effect::WorktreeOperationFailed {
+                session,
+                message: "no Agent Worktree is bound to this session".to_string(),
+            }];
+        };
+        // Resolve the commit-range key before draining: a failure here must
+        // leave the annotations in the adapter, not lose them.
+        let base = match self.git.changeset_base(&worktree) {
+            Ok(base) => base,
+            Err(message) => return vec![Effect::WorktreeOperationFailed { session, message }],
+        };
+        self.drain_annotations(&session, &worktree, &base);
+        vec![]
+    }
+
+    /// Move the adapter's captured Annotations into the persistent store
+    /// under `(worktree, base)`, refreshing an open review on that range.
+    fn drain_annotations(
+        &mut self,
+        session: &AuthoringSessionId,
+        worktree: &AgentWorktree,
+        base: &str,
+    ) {
+        let drained = self.agent.take_annotations(session);
+        if drained.is_empty() {
+            return;
+        }
+        let stored = self
+            .annotations
+            .entry(worktree.id.clone())
+            .or_default()
+            .entry(base.to_string())
+            .or_default();
+        stored.extend(drained);
+        let stored = stored.clone();
+        if let Some((_, review)) = self.reviews.iter_mut().find(|(s, _)| s == session) {
+            if review.base == base {
+                review.annotations = stored;
+            }
+        }
     }
 
     fn with_review(&mut self, session: &AuthoringSessionId, apply: impl FnOnce(&mut ReviewState)) {
@@ -166,6 +245,7 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
                 // The changeset the marks and review referred to is gone.
                 self.reviews.retain(|(s, _)| *s != session);
                 self.marks.remove(&worktree.id);
+                self.annotations.remove(&worktree.id);
                 vec![Effect::WorktreeDiscarded {
                     session,
                     worktree: worktree.id,

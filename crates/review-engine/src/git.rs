@@ -161,4 +161,11 @@ impl GitPort for SystemGitPort {
         let text = self.git(&worktree.path, &["diff", "HEAD"])?;
         Ok(parse_unified_diff(&text))
     }
+
+    fn changeset_base(&mut self, worktree: &AgentWorktree) -> Result<String, String> {
+        Ok(self
+            .git(&worktree.path, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_string())
+    }
 }

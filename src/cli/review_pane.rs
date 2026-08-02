@@ -6,7 +6,6 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
@@ -22,16 +21,45 @@ use review_engine::{
 
 const USAGE: &str = "usage: herdr review-pane --worktree <path>";
 
-/// The Review Pane has no agent to talk to yet (Hunk Conversations are a
-/// later loop stage); every Authoring Session looks gone from here.
-struct DetachedAgentPort;
+/// The read side of the Claude Code Harness Adapter: Annotations come from
+/// the product state store that `herdr annotate` (the write side, run by
+/// the agent at authoring time) filled — so they survive detach/reattach
+/// and session death. Conversations are a later loop stage; every
+/// Authoring Session still looks gone from here.
+struct StoreAgentPort {
+    store: crate::annotation_store::AnnotationStore,
+    repo_root: PathBuf,
+    branch: String,
+    /// The worktree path, so the commit-range key is resolved at drain
+    /// time — the same moment the engine resolves its own — instead of a
+    /// stale snapshot from pane launch.
+    worktree: PathBuf,
+    drained: bool,
+}
 
-impl AgentPort for DetachedAgentPort {
+impl AgentPort for StoreAgentPort {
     fn session_is_live(&self, _session: &AuthoringSessionId) -> bool {
         false
     }
 
     fn deliver_instructions(&mut self, _session: &AuthoringSessionId, _instructions: &str) {}
+
+    fn take_annotations(
+        &mut self,
+        _session: &AuthoringSessionId,
+    ) -> Vec<review_engine::Annotation> {
+        // A drain, like the trait demands: the engine now owns them, and a
+        // reopen in this process must not ingest duplicates.
+        if self.drained {
+            return Vec::new();
+        }
+        self.drained = true;
+        let Ok(base) = super::worktree_identity::head_commit(&self.worktree) else {
+            return Vec::new();
+        };
+        self.store
+            .annotations_for(&self.repo_root, &self.branch, &base)
+    }
 }
 
 /// Keeps the engine's latest render model for the draw loop.
@@ -84,36 +112,25 @@ pub(super) fn run_review_pane_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-type ReviewEngine = Engine<DetachedAgentPort, review_engine::git::SystemGitPort, LatestRender>;
-
-fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .map_err(|err| format!("failed to run git: {err}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-    }
-}
+type ReviewEngine = Engine<StoreAgentPort, review_engine::git::SystemGitPort, LatestRender>;
 
 /// Adopt the worktree through the engine and open the review on it. The
 /// engine's own guards apply: the primary checkout is not an Agent Worktree.
 fn open_review(worktree: &Path) -> Result<ReviewEngine, String> {
-    let branch = git_stdout(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    let git_common_dir = git_stdout(
-        worktree,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    let repo_root = Path::new(&git_common_dir)
-        .parent()
-        .ok_or_else(|| format!("cannot resolve repository root from {git_common_dir}"))?
-        .to_path_buf();
-    let worktrees_root = repo_root.join(".herdr-agent-worktrees");
-    let git = review_engine::git::SystemGitPort::new(repo_root, worktrees_root);
-    let mut engine = Engine::new(DetachedAgentPort, git, LatestRender::default());
+    // The same resolution `herdr annotate` keys its writes with, so the
+    // two adapter halves can never disagree on the store file.
+    let identity = super::worktree_identity::resolve_worktree_identity(worktree)?;
+    let branch = identity.branch;
+    let worktrees_root = identity.repo_root.join(".herdr-agent-worktrees");
+    let agent = StoreAgentPort {
+        store: crate::annotation_store::AnnotationStore::product(),
+        repo_root: identity.repo_root.clone(),
+        branch: branch.clone(),
+        worktree: worktree.to_path_buf(),
+        drained: false,
+    };
+    let git = review_engine::git::SystemGitPort::new(identity.repo_root, worktrees_root);
+    let mut engine = Engine::new(agent, git, LatestRender::default());
 
     let session = AuthoringSessionId::from(branch.as_str());
     let effects = engine.handle_event(Event::AgentPaneSpawned {
@@ -305,6 +322,12 @@ fn draw_stream(frame: &mut Frame, area: Rect, view: &ReviewView) -> usize {
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::BOLD),
                 ),
+                StreamRow::Annotation { what, why, .. } => (
+                    format!("● {what} — {why}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::ITALIC),
+                ),
                 StreamRow::HunkHeader {
                     header, reviewed, ..
                 } => (
@@ -336,4 +359,74 @@ fn draw_stream(frame: &mut Frame, area: Rect, view: &ReviewView) -> usize {
         frame.render_widget(Paragraph::new(lines), area);
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::annotation_store::{AnnotationStore, StoredAnnotation};
+    use std::process::Command;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn store_agent_port_drains_the_worktrees_current_range_exactly_once() {
+        let base =
+            std::env::temp_dir().join(format!("herdr-store-agent-port-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "--initial-branch=agent/pane-1"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+        let head = super::super::worktree_identity::head_commit(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+
+        let store = AnnotationStore::at(base.join("store"));
+        store
+            .append(
+                &repo,
+                "agent/pane-1",
+                &head,
+                StoredAnnotation {
+                    file: "README.md".to_string(),
+                    line: 1,
+                    what: "greet".to_string(),
+                    why: "politeness".to_string(),
+                },
+            )
+            .unwrap();
+
+        let mut port = StoreAgentPort {
+            store,
+            repo_root: repo.clone(),
+            branch: "agent/pane-1".to_string(),
+            worktree: repo,
+            drained: false,
+        };
+        let session = AuthoringSessionId::from("agent/pane-1");
+        let drained = port.take_annotations(&session);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].what, "greet");
+        assert!(
+            port.take_annotations(&session).is_empty(),
+            "a second drain must not duplicate annotations into the engine"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
