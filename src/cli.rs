@@ -9,6 +9,7 @@ use crate::api::schema::{
 };
 
 mod agent;
+mod annotate;
 mod api;
 mod completion;
 mod integration;
@@ -25,6 +26,7 @@ mod status;
 mod tab;
 mod workspace;
 mod worktree;
+mod worktree_identity;
 
 const TERMINAL_SESSION_OBSERVE_USAGE: &str =
     "usage: herdr terminal session observe <target> [--cols N] [--rows N]";
@@ -99,6 +101,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "terminal" => run_terminal_command(&args[2..])?,
         "pane" => pane::run_pane_command(&args[2..])?,
         "plugin" => plugin::run_plugin_command(&args[2..])?,
+        "annotate" => annotate::run_annotate_command(&args[2..])?,
         "review-pane" => review_pane::run_review_pane_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "session" => run_session_command(&args[2..])?,

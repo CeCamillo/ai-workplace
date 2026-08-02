@@ -22,6 +22,9 @@ pub enum Event {
     },
     /// The agent in a pane finished working.
     AgentFinished { session: AuthoringSessionId },
+    /// The Harness Adapter captured new Annotations from the session; the
+    /// engine must drain and persist them.
+    AnnotationsEmitted { session: AuthoringSessionId },
     /// The human discarded the session's changeset.
     ChangesetDiscarded { session: AuthoringSessionId },
     /// The human pressed the review keybind on a pane; open the Review Pane

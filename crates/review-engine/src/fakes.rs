@@ -3,17 +3,20 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::annotation::Annotation;
 use crate::diff::Changeset;
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
 use crate::ports::{AgentPort, GitPort, RenderModel, UiPort};
 use crate::worktree::AgentWorktree;
 
 /// Scriptable [`AgentPort`]: liveness is set by the test, delivered
-/// instructions are recorded for assertion.
+/// instructions are recorded for assertion, and pushed Annotations wait to
+/// be drained like a real adapter's capture buffer.
 #[derive(Debug, Default)]
 pub struct FakeAgentPort {
     live: HashSet<AuthoringSessionId>,
     delivered: Vec<(AuthoringSessionId, String)>,
+    pending_annotations: HashMap<AuthoringSessionId, Vec<Annotation>>,
 }
 
 impl FakeAgentPort {
@@ -28,6 +31,14 @@ impl FakeAgentPort {
     pub fn delivered(&self) -> &[(AuthoringSessionId, String)] {
         &self.delivered
     }
+
+    /// Script an Annotation the adapter captured from this session.
+    pub fn push_annotation(&mut self, session: &AuthoringSessionId, annotation: Annotation) {
+        self.pending_annotations
+            .entry(session.clone())
+            .or_default()
+            .push(annotation);
+    }
 }
 
 impl AgentPort for FakeAgentPort {
@@ -38,6 +49,10 @@ impl AgentPort for FakeAgentPort {
     fn deliver_instructions(&mut self, session: &AuthoringSessionId, instructions: &str) {
         self.delivered
             .push((session.clone(), instructions.to_string()));
+    }
+
+    fn take_annotations(&mut self, session: &AuthoringSessionId) -> Vec<Annotation> {
+        self.pending_annotations.remove(session).unwrap_or_default()
     }
 }
 
@@ -50,6 +65,7 @@ pub struct FakeGitPort {
     created: Vec<AgentWorktree>,
     discarded: Vec<AgentWorktree>,
     changeset: Changeset,
+    changeset_base: String,
     fail_next: Option<String>,
 }
 
@@ -72,6 +88,11 @@ impl FakeGitPort {
     /// returns.
     pub fn set_changeset(&mut self, changeset: Changeset) {
         self.changeset = changeset;
+    }
+
+    /// Script the commit every worktree's changeset sits on.
+    pub fn set_changeset_base(&mut self, base: &str) {
+        self.changeset_base = base.to_string();
     }
 
     pub fn created(&self) -> &[AgentWorktree] {
@@ -125,6 +146,13 @@ impl GitPort for FakeGitPort {
             return Err(message);
         }
         Ok(self.changeset.clone())
+    }
+
+    fn changeset_base(&mut self, _worktree: &AgentWorktree) -> Result<String, String> {
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        Ok(self.changeset_base.clone())
     }
 }
 

@@ -4,7 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::diff::{Changeset, DiffLineKind};
+use crate::annotation::Annotation;
+use crate::diff::{Changeset, DiffLineKind, FileDiff};
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
 use crate::worktree::AgentWorktree;
 
@@ -73,33 +74,75 @@ impl ReviewedMarks {
     }
 }
 
-/// One open Review Pane: the changeset snapshot it renders plus cursor and
-/// scroll. Marks live outside this, keyed by worktree.
+/// One open Review Pane: the changeset and Annotation snapshots it renders
+/// plus cursor and scroll. Marks live outside this, keyed by worktree.
 #[derive(Debug)]
 pub struct ReviewState {
     pub worktree: AgentWorktree,
     pub changeset: Changeset,
+    /// The commit range this review's changeset and Annotations sit on.
+    pub base: String,
+    /// The Annotations for `(worktree, base)`, in emission order.
+    pub annotations: Vec<Annotation>,
     pub cursor: usize,
     pub scroll_top: usize,
     pub viewport_rows: usize,
 }
 
 impl ReviewState {
-    pub fn new(worktree: AgentWorktree, changeset: Changeset) -> Self {
+    pub fn new(
+        worktree: AgentWorktree,
+        changeset: Changeset,
+        base: String,
+        annotations: Vec<Annotation>,
+    ) -> Self {
         Self {
             worktree,
             changeset,
+            base,
+            annotations,
             cursor: 0,
             scroll_top: 0,
             viewport_rows: 0,
         }
     }
 
+    /// Indices into `annotations` grouped by the `(file, hunk)` each one
+    /// renders above: the hunk whose post-image range covers the annotated
+    /// line, else the nearest hunk in the file. Annotations for files
+    /// outside the changeset have nowhere to render and are dropped.
+    fn placed_annotations(&self) -> HashMap<(usize, usize), Vec<usize>> {
+        let mut placed: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        for (idx, annotation) in self.annotations.iter().enumerate() {
+            let Some(file_idx) = self
+                .changeset
+                .files
+                .iter()
+                .position(|f| f.path == annotation.file)
+            else {
+                continue;
+            };
+            if let Some(hunk_idx) = hunk_for_line(&self.changeset.files[file_idx], annotation.line)
+            {
+                placed.entry((file_idx, hunk_idx)).or_default().push(idx);
+            }
+        }
+        placed
+    }
+
     fn stream_positions(&self) -> Vec<StreamPosition> {
+        let placed = self.placed_annotations();
         let mut rows = Vec::new();
         for (file_idx, file) in self.changeset.files.iter().enumerate() {
             rows.push(StreamPosition::FileHeader { file: file_idx });
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+                let annotations = placed.get(&(file_idx, hunk_idx)).map(Vec::len).unwrap_or(0);
+                for _ in 0..annotations {
+                    rows.push(StreamPosition::Annotation {
+                        file: file_idx,
+                        hunk: hunk_idx,
+                    });
+                }
                 rows.push(StreamPosition::HunkHeader {
                     file: file_idx,
                     hunk: hunk_idx,
@@ -153,10 +196,12 @@ impl ReviewState {
     }
 
     /// The `(path, hunk index)` under the cursor, if the cursor is on or
-    /// inside a hunk.
+    /// inside a hunk (its Annotation rows included).
     fn hunk_under_cursor(&self) -> Option<(String, usize)> {
         match self.stream_positions().get(self.cursor)? {
-            StreamPosition::HunkHeader { file, hunk } | StreamPosition::Line { file, hunk } => {
+            StreamPosition::Annotation { file, hunk }
+            | StreamPosition::HunkHeader { file, hunk }
+            | StreamPosition::Line { file, hunk } => {
                 Some((self.changeset.files[*file].path.clone(), *hunk))
             }
             StreamPosition::FileHeader { .. } => None,
@@ -167,6 +212,7 @@ impl ReviewState {
     fn file_under_cursor(&self) -> Option<usize> {
         match self.stream_positions().get(self.cursor)? {
             StreamPosition::FileHeader { file }
+            | StreamPosition::Annotation { file, .. }
             | StreamPosition::HunkHeader { file, .. }
             | StreamPosition::Line { file, .. } => Some(*file),
         }
@@ -206,6 +252,7 @@ impl ReviewState {
                 }
             })
             .collect();
+        let placed = self.placed_annotations();
         let mut stream = Vec::new();
         for (file_idx, file) in self.changeset.files.iter().enumerate() {
             stream.push(StreamRow::FileHeader {
@@ -214,6 +261,15 @@ impl ReviewState {
                 reviewed: marks.file_reviewed(&file.path, file.hunks.len()),
             });
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+                for annotation_idx in placed.get(&(file_idx, hunk_idx)).into_iter().flatten() {
+                    let annotation = &self.annotations[*annotation_idx];
+                    stream.push(StreamRow::Annotation {
+                        file: file_idx,
+                        hunk: hunk_idx,
+                        what: annotation.what.clone(),
+                        why: annotation.why.clone(),
+                    });
+                }
                 stream.push(StreamRow::HunkHeader {
                     file: file_idx,
                     hunk: hunk_idx,
@@ -245,8 +301,35 @@ impl ReviewState {
 /// the display payload.
 enum StreamPosition {
     FileHeader { file: usize },
+    Annotation { file: usize, hunk: usize },
     HunkHeader { file: usize, hunk: usize },
     Line { file: usize, hunk: usize },
+}
+
+/// The hunk of `file` whose post-image range covers `line`, else the
+/// nearest hunk by line distance; `None` only when the file has no hunk
+/// with a parseable range.
+fn hunk_for_line(file: &FileDiff, line: usize) -> Option<usize> {
+    let ranges: Vec<(usize, (usize, usize))> = file
+        .hunks
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, hunk)| hunk.post_image_range().map(|range| (idx, range)))
+        .collect();
+    ranges
+        .iter()
+        .find(|(_, (start, count))| line >= *start && line < start + (*count).max(1))
+        .or_else(|| {
+            ranges.iter().min_by_key(|(_, (start, count))| {
+                let end = start + (*count).max(1) - 1;
+                if line < *start {
+                    *start - line
+                } else {
+                    line - end
+                }
+            })
+        })
+        .map(|(idx, _)| *idx)
 }
 
 fn is_hunk_header(row: &StreamPosition) -> bool {
@@ -318,6 +401,13 @@ pub enum StreamRow {
         file: usize,
         path: String,
         reviewed: bool,
+    },
+    /// An agent Annotation, rendered inline above the hunk it explains.
+    Annotation {
+        file: usize,
+        hunk: usize,
+        what: String,
+        why: String,
     },
     HunkHeader {
         file: usize,

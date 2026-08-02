@@ -55,6 +55,7 @@ fn set_host_color_scheme_reports(enabled: bool) -> io::Result<()> {
 }
 
 mod agent_resume;
+mod annotation_store;
 mod api;
 mod app;
 mod build_info;
