@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::annotation::Annotation;
+use crate::conversation::{Conversation, ConversationEntry, ConversationView, SessionSeed};
 use crate::diff::{Changeset, DiffLineKind, FileDiff};
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
 use crate::worktree::AgentWorktree;
@@ -87,6 +88,12 @@ pub struct ReviewState {
     pub cursor: usize,
     pub scroll_top: usize,
     pub viewport_rows: usize,
+    /// The open Hunk Conversation, at most one per review.
+    pub conversation: Option<Conversation>,
+    /// How many in-flight answers each session still owes to conversations
+    /// that were abandoned while awaiting one. Those answers are dropped on
+    /// arrival instead of attaching to whatever hunk is open by then.
+    stale_answers: HashMap<AuthoringSessionId, usize>,
 }
 
 impl ReviewState {
@@ -104,7 +111,105 @@ impl ReviewState {
             cursor: 0,
             scroll_top: 0,
             viewport_rows: 0,
+            conversation: None,
+            stale_answers: HashMap::new(),
         }
+    }
+
+    /// Open a Hunk Conversation anchored to the hunk under the cursor;
+    /// no-op when the cursor is not on a hunk. Replacing a conversation
+    /// abandons it like closing does.
+    pub fn open_conversation(&mut self) {
+        if let Some((file, hunk)) = self.hunk_under_cursor() {
+            self.abandon_pending_answer();
+            self.conversation = Some(Conversation {
+                file,
+                hunk,
+                target: None,
+                entries: Vec::new(),
+                awaiting_answer: false,
+            });
+        }
+    }
+
+    pub fn close_conversation(&mut self) {
+        self.abandon_pending_answer();
+        self.conversation = None;
+    }
+
+    /// Deliver `target`'s answer to the open conversation — unless it was
+    /// owed to an abandoned one, or no open conversation is awaiting an
+    /// answer from that session; those answers are dropped.
+    pub fn receive_answer(&mut self, target: &AuthoringSessionId, answer: String) {
+        if let Some(pending) = self.stale_answers.get_mut(target) {
+            *pending -= 1;
+            if *pending == 0 {
+                self.stale_answers.remove(target);
+            }
+            return;
+        }
+        if let Some(conversation) = self.conversation.as_mut() {
+            if conversation.awaiting_answer
+                && conversation
+                    .target
+                    .as_ref()
+                    .is_some_and(|(routed, _)| routed == target)
+            {
+                conversation.entries.push(ConversationEntry::Answer(answer));
+                conversation.awaiting_answer = false;
+            }
+        }
+    }
+
+    /// The open conversation is going away; if it still awaits an answer,
+    /// remember to drop that answer when it arrives.
+    fn abandon_pending_answer(&mut self) {
+        if let Some(conversation) = self.conversation.as_ref() {
+            if conversation.awaiting_answer {
+                if let Some((target, _)) = conversation.target.clone() {
+                    *self.stale_answers.entry(target).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    /// The seed a fresh session needs to stand in for the gone Authoring
+    /// Session on the open conversation's hunk (ADR-0003): the hunk's diff
+    /// plus the stored Annotations placed on it.
+    pub fn conversation_seed(&self) -> Option<SessionSeed> {
+        let conversation = self.conversation.as_ref()?;
+        let file_idx = self
+            .changeset
+            .files
+            .iter()
+            .position(|f| f.path == conversation.file)?;
+        let hunk = self.changeset.files[file_idx]
+            .hunks
+            .get(conversation.hunk)?;
+        let mut diff = hunk.header.clone();
+        for line in &hunk.lines {
+            let prefix = match line.kind {
+                DiffLineKind::Added => '+',
+                DiffLineKind::Removed => '-',
+                DiffLineKind::Context => ' ',
+            };
+            diff.push('\n');
+            diff.push(prefix);
+            diff.push_str(&line.content);
+        }
+        let annotations = self
+            .placed_annotations()
+            .get(&(file_idx, conversation.hunk))
+            .into_iter()
+            .flatten()
+            .map(|idx| self.annotations[*idx].clone())
+            .collect();
+        Some(SessionSeed {
+            file: conversation.file.clone(),
+            hunk_header: hunk.header.clone(),
+            diff,
+            annotations,
+        })
     }
 
     /// Indices into `annotations` grouped by the `(file, hunk)` each one
@@ -293,7 +398,28 @@ impl ReviewState {
             cursor_file: self.file_under_cursor(),
             scroll_top: self.scroll_top,
             viewport_rows: self.viewport_rows,
+            conversation: self.conversation_view(),
         }
+    }
+
+    fn conversation_view(&self) -> Option<ConversationView> {
+        let conversation = self.conversation.as_ref()?;
+        let hunk_header = self
+            .changeset
+            .files
+            .iter()
+            .find(|f| f.path == conversation.file)
+            .and_then(|f| f.hunks.get(conversation.hunk))
+            .map(|hunk| hunk.header.clone())
+            .unwrap_or_default();
+        Some(ConversationView {
+            file: conversation.file.clone(),
+            hunk: conversation.hunk,
+            hunk_header,
+            routing: conversation.target.as_ref().map(|(_, routing)| *routing),
+            entries: conversation.entries.clone(),
+            awaiting_answer: conversation.awaiting_answer,
+        })
     }
 }
 
@@ -383,6 +509,8 @@ pub struct ReviewView {
     pub cursor_file: Option<usize>,
     pub scroll_top: usize,
     pub viewport_rows: usize,
+    /// The open Hunk Conversation, drawn anchored to its hunk.
+    pub conversation: Option<ConversationView>,
 }
 
 /// One file sidebar row.

@@ -1,4 +1,5 @@
 use crate::annotation::Annotation;
+use crate::conversation::SessionSeed;
 use crate::diff::Changeset;
 use crate::ids::AuthoringSessionId;
 use crate::review::ReviewView;
@@ -17,6 +18,11 @@ pub trait AgentPort {
     /// Drain the Annotations the adapter captured from this session since
     /// the last drain. The engine persists them; the adapter must not.
     fn take_annotations(&mut self, session: &AuthoringSessionId) -> Vec<Annotation>;
+
+    /// Spawn a fresh agent session seeded to stand in for a gone Authoring
+    /// Session in a Hunk Conversation (ADR-0003 fallback). Returns the new
+    /// session's id.
+    fn spawn_seeded_session(&mut self, seed: &SessionSeed) -> Result<AuthoringSessionId, String>;
 }
 
 /// Git operations on Agent Worktrees. All fallible: real git can refuse any

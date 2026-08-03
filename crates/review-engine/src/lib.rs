@@ -10,6 +10,7 @@
 //! three ports faked ([`fakes`]).
 
 mod annotation;
+mod conversation;
 mod diff;
 mod engine;
 mod event;
@@ -21,6 +22,7 @@ mod review;
 mod worktree;
 
 pub use annotation::{Annotation, AnnotationsSnapshot};
+pub use conversation::{ConversationEntry, ConversationRouting, ConversationView, SessionSeed};
 pub use diff::{parse_unified_diff, Changeset, DiffLine, DiffLineKind, FileDiff, Hunk};
 pub use engine::Engine;
 pub use event::{Effect, Event, WorktreeSpawn};

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::annotation::AnnotationsSnapshot;
+use crate::conversation::{ConversationEntry, ConversationRouting};
 use crate::event::{Effect, Event, WorktreeSpawn};
 use crate::ids::AuthoringSessionId;
 use crate::ports::{AgentPort, GitPort, RenderModel, UiPort};
@@ -107,6 +108,25 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
                 self.toggle_mark(&session, target);
                 vec![]
             }
+            Event::ConversationOpened { session } => {
+                self.with_review(&session, |review| review.open_conversation());
+                vec![]
+            }
+            Event::ConversationClosed { session } => {
+                self.with_review(&session, |review| review.close_conversation());
+                vec![]
+            }
+            Event::ConversationAsked { session, question } => {
+                self.ask_conversation(session, question)
+            }
+            Event::ConversationAnswerReceived {
+                session,
+                target,
+                answer,
+            } => {
+                self.with_review(&session, |review| review.receive_answer(&target, answer));
+                vec![]
+            }
         };
         self.render();
         effects
@@ -203,6 +223,65 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
                 review.annotations = stored;
             }
         }
+    }
+
+    /// Deliver a conversation question, resolving the routing on the first
+    /// ask (ADR-0003): the live Authoring Session when the AgentPort says
+    /// it is alive, else a fresh session spawned seeded with the stored
+    /// Annotation and hunk diff. Once routed, follow-ups stay on the same
+    /// session.
+    fn ask_conversation(&mut self, session: AuthoringSessionId, question: String) -> Vec<Effect> {
+        // Split borrow: the review is mutated while the AgentPort routes.
+        let Self { agent, reviews, .. } = self;
+        let Some((_, review)) = reviews.iter_mut().find(|(s, _)| *s == session) else {
+            return vec![];
+        };
+        let Some(seed) = review.conversation_seed() else {
+            return vec![];
+        };
+        let Some(conversation) = review.conversation.as_mut() else {
+            return vec![];
+        };
+        let resolved = match conversation.target.clone() {
+            Some(target) => Ok(target),
+            None if agent.session_is_live(&session) => {
+                Ok((session.clone(), ConversationRouting::LiveAuthoringSession))
+            }
+            None => agent
+                .spawn_seeded_session(&seed)
+                .map(|id| (id, ConversationRouting::SeededSession)),
+        };
+        let (target, routing) = match resolved {
+            Ok(target) => target,
+            Err(message) => {
+                // The failure joins the transcript so the pane shows what
+                // was asked and why it went unanswered.
+                conversation
+                    .entries
+                    .push(ConversationEntry::Question(question));
+                conversation
+                    .entries
+                    .push(ConversationEntry::Answer(format!("(no answer: {message})")));
+                return vec![Effect::ConversationFailed { session, message }];
+            }
+        };
+        conversation.target = Some((target.clone(), routing));
+        // Anchor with the full hunk diff: a live session may have compacted
+        // the hunk out of its context, and the header alone won't place it.
+        let prompt = format!(
+            "The reviewer is asking about this hunk of {}:\n{}\n\n{question}",
+            seed.file, seed.diff
+        );
+        agent.deliver_instructions(&target, &prompt);
+        conversation
+            .entries
+            .push(ConversationEntry::Question(question));
+        conversation.awaiting_answer = true;
+        vec![Effect::ConversationRouted {
+            session,
+            target,
+            routing,
+        }]
     }
 
     fn with_review(&mut self, session: &AuthoringSessionId, apply: impl FnOnce(&mut ReviewState)) {
