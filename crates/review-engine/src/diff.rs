@@ -55,6 +55,40 @@ pub enum DiffLineKind {
     Removed,
 }
 
+/// Match `old`'s hunks to `new`'s by content: a longest common subsequence
+/// on line-identical hunks (headers are ignored — line offsets shift when
+/// surrounding hunks change), so one coincidental match can never steal a
+/// pairing from genuinely-unchanged hunks after it. Returns in-order
+/// `(old index, new index)` pairs. This is the "content is unchanged"
+/// heuristic reviewed-marks and drafts survive a diff refresh by.
+pub(crate) fn match_hunks(old: &FileDiff, new: &FileDiff) -> Vec<(usize, usize)> {
+    // lcs[i][j]: matched pairs between old.hunks[i..] and new.hunks[j..].
+    let mut lcs = vec![vec![0usize; new.hunks.len() + 1]; old.hunks.len() + 1];
+    for i in (0..old.hunks.len()).rev() {
+        for j in (0..new.hunks.len()).rev() {
+            lcs[i][j] = if old.hunks[i].lines == new.hunks[j].lines {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < old.hunks.len() && j < new.hunks.len() {
+        if old.hunks[i].lines == new.hunks[j].lines {
+            pairs.push((i, j));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
+}
+
 /// Parse `git diff` unified output into a [`Changeset`]. Unknown lines
 /// (mode changes, index lines, binary notices) are skipped; a file with no
 /// hunks (e.g. binary) still appears so it can be marked reviewed.

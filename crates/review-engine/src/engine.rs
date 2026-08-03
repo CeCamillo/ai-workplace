@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use crate::annotation::AnnotationsSnapshot;
+use crate::annotation::{Annotation, AnnotationsSnapshot};
 use crate::conversation::{ConversationEntry, ConversationRouting};
+use crate::diff::Changeset;
 use crate::event::{Effect, Event, WorktreeSpawn};
 use crate::ids::AuthoringSessionId;
 use crate::ports::{AgentPort, GitPort, RenderModel, UiPort};
@@ -87,7 +88,11 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
             Event::AgentPaneSpawned { session, worktree } => self.bind_worktree(session, worktree),
             Event::AgentFinished { session } => {
                 self.model.ready_for_review.push(session.clone());
-                vec![Effect::ReadyForReview { session }]
+                let mut effects = vec![Effect::ReadyForReview {
+                    session: session.clone(),
+                }];
+                effects.extend(self.refresh_review(&session));
+                effects
             }
             Event::AnnotationsEmitted { session } => self.ingest_annotations(session),
             Event::ChangesetDiscarded { session } => self.discard_changeset(session),
@@ -127,6 +132,23 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
                 self.with_review(&session, |review| review.receive_answer(&target, answer));
                 vec![]
             }
+            Event::CommentDrafted { session, text } => {
+                self.with_review(&session, |review| review.draft_comment(text));
+                vec![]
+            }
+            Event::CommentEdited {
+                session,
+                comment,
+                text,
+            } => {
+                self.with_review(&session, |review| review.edit_comment(comment, text));
+                vec![]
+            }
+            Event::CommentDeleted { session, comment } => {
+                self.with_review(&session, |review| review.delete_comment(comment));
+                vec![]
+            }
+            Event::ReviewSubmitted { session } => self.submit_review(session),
         };
         self.render();
         effects
@@ -146,6 +168,27 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
         self.ui.render(&self.model);
     }
 
+    /// The inputs a Review Pane draws from the ports: the worktree's
+    /// current changeset, the commit-range key it sits on, and the stored
+    /// Annotations for that range — with anything still sitting in the
+    /// adapter drained in first.
+    fn load_review_inputs(
+        &mut self,
+        session: &AuthoringSessionId,
+        worktree: &AgentWorktree,
+    ) -> Result<(Changeset, String, Vec<Annotation>), String> {
+        let changeset = self.git.changeset_diff(worktree)?;
+        let base = self.git.changeset_base(worktree)?;
+        self.drain_annotations(session, worktree, &base);
+        let annotations = self
+            .annotations
+            .get(&worktree.id)
+            .and_then(|ranges| ranges.get(&base))
+            .cloned()
+            .unwrap_or_default();
+        Ok((changeset, base, annotations))
+    }
+
     fn open_review(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
         let Some(worktree) = self.worktrees.get(&session).cloned() else {
             return vec![Effect::ReviewOpenFailed {
@@ -153,22 +196,10 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
                 message: "no Agent Worktree is bound to this session".to_string(),
             }];
         };
-        let changeset = match self.git.changeset_diff(&worktree) {
-            Ok(changeset) => changeset,
+        let (changeset, base, annotations) = match self.load_review_inputs(&session, &worktree) {
+            Ok(inputs) => inputs,
             Err(message) => return vec![Effect::ReviewOpenFailed { session, message }],
         };
-        let base = match self.git.changeset_base(&worktree) {
-            Ok(base) => base,
-            Err(message) => return vec![Effect::ReviewOpenFailed { session, message }],
-        };
-        // Annotations still sitting in the adapter belong to this review.
-        self.drain_annotations(&session, &worktree, &base);
-        let annotations = self
-            .annotations
-            .get(&worktree.id)
-            .and_then(|ranges| ranges.get(&base))
-            .cloned()
-            .unwrap_or_default();
         let worktree_id = worktree.id.clone();
         self.reviews.retain(|(s, _)| *s != session);
         self.reviews.push((
@@ -282,6 +313,49 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
             target,
             routing,
         }]
+    }
+
+    /// Batch the review's drafted Fix-it Comments into one structured
+    /// instruction set and deliver it to the Agent. The session drops out
+    /// of Ready-for-Review: it is working again. No-op without an open
+    /// review or without drafts.
+    fn submit_review(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
+        let Some((_, review)) = self.reviews.iter_mut().find(|(s, _)| *s == session) else {
+            return vec![];
+        };
+        let Some(instructions) = review.take_review_instructions() else {
+            return vec![];
+        };
+        self.agent.deliver_instructions(&session, &instructions);
+        self.model.ready_for_review.retain(|s| *s != session);
+        vec![Effect::ReviewDelivered { session }]
+    }
+
+    /// Re-fetch the diff for the session's open Review Pane after the
+    /// agent finished acting (e.g. on a submitted Review). Reviewed-marks
+    /// and remaining drafts survive wherever hunk content is unchanged. A
+    /// failure keeps the pane on the last good changeset.
+    fn refresh_review(&mut self, session: &AuthoringSessionId) -> Vec<Effect> {
+        let Some((_, review)) = self.reviews.iter().find(|(s, _)| s == session) else {
+            return vec![];
+        };
+        let worktree = review.worktree.clone();
+        let (changeset, base, annotations) = match self.load_review_inputs(session, &worktree) {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                return vec![Effect::ReviewRefreshFailed {
+                    session: session.clone(),
+                    message,
+                }]
+            }
+        };
+        // Split borrow: the review mutates while the marks map is entered.
+        let Self { reviews, marks, .. } = self;
+        if let Some((_, review)) = reviews.iter_mut().find(|(s, _)| s == session) {
+            let marks = marks.entry(worktree.id.clone()).or_default();
+            review.refresh(changeset, base, annotations, marks);
+        }
+        vec![]
     }
 
     fn with_review(&mut self, session: &AuthoringSessionId, apply: impl FnOnce(&mut ReviewState)) {

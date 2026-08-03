@@ -5,8 +5,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::annotation::Annotation;
+use crate::comment::FixItComment;
 use crate::conversation::{Conversation, ConversationEntry, ConversationView, SessionSeed};
-use crate::diff::{Changeset, DiffLineKind, FileDiff};
+use crate::diff::{match_hunks, Changeset, DiffLineKind, FileDiff, Hunk};
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
 use crate::worktree::AgentWorktree;
 
@@ -46,6 +47,33 @@ pub struct ReviewedMarks {
 pub type ReviewedMarksSnapshot = HashMap<AgentWorktreeId, ReviewedMarks>;
 
 impl ReviewedMarks {
+    /// The marks carried over a diff refresh: a hunk mark follows its hunk
+    /// (by content, via [`match_hunks`]) to the hunk's new index; an
+    /// explicit file mark survives only when every hunk of the file is
+    /// unchanged. Marks on files or hunks that changed are dropped —
+    /// re-review only costs the parts that moved.
+    fn remapped(&self, old: &Changeset, new: &Changeset) -> ReviewedMarks {
+        let mut remapped = ReviewedMarks::default();
+        for new_file in &new.files {
+            let path = &new_file.path;
+            let Some(old_file) = old.files.iter().find(|f| f.path == *path) else {
+                continue;
+            };
+            let pairs = match_hunks(old_file, new_file);
+            for (old_idx, new_idx) in &pairs {
+                if self.hunks.contains(&(path.clone(), *old_idx)) {
+                    remapped.hunks.insert((path.clone(), *new_idx));
+                }
+            }
+            let unchanged =
+                old_file.hunks.len() == new_file.hunks.len() && pairs.len() == old_file.hunks.len();
+            if unchanged && self.files.contains(path) {
+                remapped.files.insert(path.clone());
+            }
+        }
+        remapped
+    }
+
     fn file_reviewed(&self, path: &str, hunk_count: usize) -> bool {
         self.files.contains(path)
             || (hunk_count > 0
@@ -90,6 +118,8 @@ pub struct ReviewState {
     pub viewport_rows: usize,
     /// The open Hunk Conversation, at most one per review.
     pub conversation: Option<Conversation>,
+    /// Drafted Fix-it Comments in draft order, local until submit.
+    pub drafts: Vec<FixItComment>,
     /// How many in-flight answers each session still owes to conversations
     /// that were abandoned while awaiting one. Those answers are dropped on
     /// arrival instead of attaching to whatever hunk is open by then.
@@ -112,8 +142,120 @@ impl ReviewState {
             scroll_top: 0,
             viewport_rows: 0,
             conversation: None,
+            drafts: Vec::new(),
             stale_answers: HashMap::new(),
         }
+    }
+
+    /// Draft a Fix-it Comment on the hunk under the cursor; no-op when the
+    /// cursor is not on a hunk.
+    pub fn draft_comment(&mut self, text: String) {
+        if let Some((file, hunk)) = self.hunk_under_cursor() {
+            self.drafts.push(FixItComment { file, hunk, text });
+        }
+    }
+
+    /// Replace draft `comment`'s text; no-op on an out-of-range index.
+    pub fn edit_comment(&mut self, comment: usize, text: String) {
+        if let Some(draft) = self.drafts.get_mut(comment) {
+            draft.text = text;
+        }
+    }
+
+    /// Delete draft `comment`; no-op on an out-of-range index.
+    pub fn delete_comment(&mut self, comment: usize) {
+        if comment < self.drafts.len() {
+            self.drafts.remove(comment);
+        }
+    }
+
+    /// Take the batched Review as one structured instruction set: every
+    /// draft in changeset order, each anchored by file path, post-image
+    /// line, and hunk header. The drafts leave with it — a submitted
+    /// Review clears the pane. `None`, and no state change, when there
+    /// are no drafts.
+    pub fn take_review_instructions(&mut self) -> Option<String> {
+        if self.drafts.is_empty() {
+            return None;
+        }
+        // Changeset order (file, then hunk, then draft order), so the
+        // agent reads the Review the way the reviewer read the diff.
+        let mut ordered: Vec<(usize, &FixItComment)> = self
+            .drafts
+            .iter()
+            .map(|draft| {
+                let file = self
+                    .changeset
+                    .files
+                    .iter()
+                    .position(|f| f.path == draft.file)
+                    .unwrap_or(usize::MAX);
+                (file, draft)
+            })
+            .collect();
+        ordered.sort_by_key(|(file, draft)| (*file, draft.hunk));
+        let mut instructions = format!(
+            "The reviewer submitted a Review of your changeset: {} fix-it comment(s). \
+             Apply every one of them at its anchored location.",
+            ordered.len()
+        );
+        for (idx, (file, draft)) in ordered.iter().enumerate() {
+            let hunk = self
+                .changeset
+                .files
+                .get(*file)
+                .and_then(|f| f.hunks.get(draft.hunk));
+            let line = hunk
+                .and_then(Hunk::post_image_range)
+                .map(|(start, _)| start)
+                .unwrap_or(0);
+            let header = hunk.map(|h| h.header.as_str()).unwrap_or("");
+            instructions.push_str(&format!(
+                "\n\n{}. {}:{line} ({header})\n{}",
+                idx + 1,
+                draft.file,
+                draft.text
+            ));
+        }
+        self.drafts.clear();
+        Some(instructions)
+    }
+
+    /// Swap in the re-fetched changeset after the agent acted on the
+    /// Review. `marks` (the worktree's reviewed-marks) and the drafts are
+    /// remapped onto content-identical hunks; anything anchored to changed
+    /// content is dropped. The conversation closes — its hunk may be gone —
+    /// and the cursor clamps into the new stream.
+    pub fn refresh(
+        &mut self,
+        changeset: Changeset,
+        base: String,
+        annotations: Vec<Annotation>,
+        marks: &mut ReviewedMarks,
+    ) {
+        *marks = marks.remapped(&self.changeset, &changeset);
+        self.drafts = std::mem::take(&mut self.drafts)
+            .into_iter()
+            .filter_map(|draft| {
+                let old_file = self.changeset.files.iter().find(|f| f.path == draft.file)?;
+                let new_file = changeset.files.iter().find(|f| f.path == draft.file)?;
+                let (_, new_hunk) = match_hunks(old_file, new_file)
+                    .into_iter()
+                    .find(|(old_idx, _)| *old_idx == draft.hunk)?;
+                Some(FixItComment {
+                    hunk: new_hunk,
+                    ..draft
+                })
+            })
+            .collect();
+        self.close_conversation();
+        self.changeset = changeset;
+        self.base = base;
+        self.annotations = annotations;
+        let rows = self.stream_positions().len();
+        self.cursor = self.cursor.min(rows.saturating_sub(1));
+        self.scroll_top = self.scroll_top.min(self.cursor);
+        self.follow_cursor();
     }
 
     /// Open a Hunk Conversation anchored to the hunk under the cursor;
@@ -258,9 +400,25 @@ impl ReviewState {
                         hunk: hunk_idx,
                     });
                 }
+                for _ in self.hunk_drafts(&file.path, hunk_idx) {
+                    rows.push(StreamPosition::Comment {
+                        file: file_idx,
+                        hunk: hunk_idx,
+                    });
+                }
             }
         }
         rows
+    }
+
+    /// The draft indices anchored to `(path, hunk)`, in draft order.
+    fn hunk_drafts(&self, path: &str, hunk: usize) -> Vec<usize> {
+        self.drafts
+            .iter()
+            .enumerate()
+            .filter(|(_, draft)| draft.file == path && draft.hunk == hunk)
+            .map(|(idx, _)| idx)
+            .collect()
     }
 
     pub fn apply_motion(&mut self, motion: ReviewMotion) {
@@ -306,7 +464,8 @@ impl ReviewState {
         match self.stream_positions().get(self.cursor)? {
             StreamPosition::Annotation { file, hunk }
             | StreamPosition::HunkHeader { file, hunk }
-            | StreamPosition::Line { file, hunk } => {
+            | StreamPosition::Line { file, hunk }
+            | StreamPosition::Comment { file, hunk } => {
                 Some((self.changeset.files[*file].path.clone(), *hunk))
             }
             StreamPosition::FileHeader { .. } => None,
@@ -319,7 +478,8 @@ impl ReviewState {
             StreamPosition::FileHeader { file }
             | StreamPosition::Annotation { file, .. }
             | StreamPosition::HunkHeader { file, .. }
-            | StreamPosition::Line { file, .. } => Some(*file),
+            | StreamPosition::Line { file, .. }
+            | StreamPosition::Comment { file, .. } => Some(*file),
         }
     }
 
@@ -387,6 +547,14 @@ impl ReviewState {
                         content: line.content.clone(),
                     });
                 }
+                for comment_idx in self.hunk_drafts(&file.path, hunk_idx) {
+                    stream.push(StreamRow::Comment {
+                        file: file_idx,
+                        hunk: hunk_idx,
+                        comment: comment_idx,
+                        text: self.drafts[comment_idx].text.clone(),
+                    });
+                }
             }
         }
         ReviewView {
@@ -430,6 +598,7 @@ enum StreamPosition {
     Annotation { file: usize, hunk: usize },
     HunkHeader { file: usize, hunk: usize },
     Line { file: usize, hunk: usize },
+    Comment { file: usize, hunk: usize },
 }
 
 /// The hunk of `file` whose post-image range covers `line`, else the
@@ -546,5 +715,15 @@ pub enum StreamRow {
     Line {
         kind: DiffLineKind,
         content: String,
+    },
+    /// A drafted Fix-it Comment, rendered inline below the hunk it is
+    /// anchored to. `comment` is the draft's index in draft order — the
+    /// handle [`crate::Event::CommentEdited`] and
+    /// [`crate::Event::CommentDeleted`] take.
+    Comment {
+        file: usize,
+        hunk: usize,
+        comment: usize,
+        text: String,
     },
 }

@@ -69,6 +69,27 @@ pub enum Event {
         target: AuthoringSessionId,
         answer: String,
     },
+    /// The human drafted a Fix-it Comment on the hunk under the cursor.
+    /// No-op when the cursor is not on a hunk. Local until submit.
+    CommentDrafted {
+        session: AuthoringSessionId,
+        text: String,
+    },
+    /// The human edited draft `comment` (its index in draft order).
+    CommentEdited {
+        session: AuthoringSessionId,
+        comment: usize,
+        text: String,
+    },
+    /// The human deleted draft `comment` (its index in draft order).
+    CommentDeleted {
+        session: AuthoringSessionId,
+        comment: usize,
+    },
+    /// The human submitted the Review: batch every draft into one
+    /// structured instruction set and deliver it to the Agent. No-op when
+    /// there are no drafts.
+    ReviewSubmitted { session: AuthoringSessionId },
 }
 
 /// Something the engine wants the host to do in response to an [`Event`].
@@ -117,6 +138,17 @@ pub enum Effect {
     /// The conversation question could not be delivered (e.g. the seeded
     /// session failed to spawn); surface the message to the human.
     ConversationFailed {
+        session: AuthoringSessionId,
+        message: String,
+    },
+    /// The submitted Review was delivered to the Agent as one structured
+    /// instruction set; the session is working again and no longer
+    /// Ready-for-Review.
+    ReviewDelivered { session: AuthoringSessionId },
+    /// The open Review Pane could not refresh its diff after the agent
+    /// finished; it keeps drawing the last good changeset. Surface the
+    /// message to the human.
+    ReviewRefreshFailed {
         session: AuthoringSessionId,
         message: String,
     },
