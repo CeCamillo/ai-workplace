@@ -274,6 +274,14 @@ fn run_claude_print(
     Ok((text, claude_session))
 }
 
+/// Which Fix-it Comment the input box is writing: a fresh draft on the
+/// hunk under the cursor, or an edit of an existing draft. TUI
+/// presentation state, like the input buffer itself.
+enum CommentInput {
+    New,
+    Edit(usize),
+}
+
 /// Keeps the engine's latest render model for the draw loop.
 #[derive(Default)]
 struct LatestRender {
@@ -375,8 +383,13 @@ fn run_tui(
     };
     let mut terminal = ratatui::init();
     let mut viewport_rows = 0usize;
-    // The question being typed: TUI presentation state, not engine state.
+    // The text being typed (a question or a Fix-it Comment) and which box
+    // owns it: TUI presentation state, not engine state.
     let mut input = String::new();
+    let mut comment_input: Option<CommentInput> = None;
+    // A submitted Review is out with the agent; its completed `claude -p`
+    // turn comes back on the answers channel and means "the agent acted".
+    let mut awaiting_review = false;
     let result = loop {
         while let Ok(answer) = answers.try_recv() {
             if let Some(claude_session) = answer.claude_session {
@@ -384,6 +397,27 @@ fn run_tui(
                     .agent_mut()
                     .router
                     .record_claude_session(&answer.target, claude_session);
+            }
+            // The turn that applied the submitted Review finished: refresh
+            // the diff instead of treating it as a conversation answer —
+            // unless a live-session conversation is still owed one (then
+            // the conversation wins and the next turn ends the Review).
+            let live_conversation_awaiting = engine
+                .ui()
+                .model
+                .reviews
+                .first()
+                .and_then(|review| review.conversation.as_ref())
+                .is_some_and(|conversation| {
+                    conversation.awaiting_answer
+                        && conversation.routing == Some(ConversationRouting::LiveAuthoringSession)
+                });
+            if awaiting_review && answer.target == session && !live_conversation_awaiting {
+                awaiting_review = false;
+                engine.handle_event(Event::AgentFinished {
+                    session: session.clone(),
+                });
+                continue;
             }
             engine.handle_event(Event::ConversationAnswerReceived {
                 session: session.clone(),
@@ -396,7 +430,13 @@ fn run_tui(
         };
         let mut stream_rows = 0usize;
         if let Err(err) = terminal.draw(|frame| {
-            stream_rows = draw(frame, &view, &input);
+            stream_rows = draw(
+                frame,
+                &view,
+                &input,
+                comment_input.as_ref(),
+                awaiting_review,
+            );
         }) {
             break Err(err);
         }
@@ -445,6 +485,39 @@ fn run_tui(
             }
             continue;
         }
+        // An active Fix-it Comment box captures the keyboard likewise.
+        if comment_input.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    input.clear();
+                    comment_input = None;
+                }
+                KeyCode::Enter if !input.trim().is_empty() => {
+                    let text = std::mem::take(&mut input);
+                    match comment_input.take() {
+                        Some(CommentInput::Edit(comment)) => {
+                            engine.handle_event(Event::CommentEdited {
+                                session: session.clone(),
+                                comment,
+                                text,
+                            });
+                        }
+                        _ => {
+                            engine.handle_event(Event::CommentDrafted {
+                                session: session.clone(),
+                                text,
+                            });
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if !ctrl => input.push(c),
+                _ => {}
+            }
+            continue;
+        }
         let motion = match key.code {
             KeyCode::Char('j') | KeyCode::Down => Some(ReviewMotion::LineDown),
             KeyCode::Char('k') | KeyCode::Up => Some(ReviewMotion::LineUp),
@@ -481,6 +554,42 @@ fn run_tui(
                     session: session.clone(),
                 });
             }
+            KeyCode::Char('f') => {
+                // Drafting only anchors to a hunk; opening the box on a
+                // file header would swallow a comment the engine drops.
+                if !matches!(
+                    view.stream.get(view.cursor),
+                    None | Some(StreamRow::FileHeader { .. })
+                ) {
+                    comment_input = Some(CommentInput::New);
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(StreamRow::Comment { comment, text, .. }) = view.stream.get(view.cursor)
+                {
+                    input = text.clone();
+                    comment_input = Some(CommentInput::Edit(*comment));
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(StreamRow::Comment { comment, .. }) = view.stream.get(view.cursor) {
+                    engine.handle_event(Event::CommentDeleted {
+                        session: session.clone(),
+                        comment: *comment,
+                    });
+                }
+            }
+            KeyCode::Char('S') => {
+                let effects = engine.handle_event(Event::ReviewSubmitted {
+                    session: session.clone(),
+                });
+                if effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::ReviewDelivered { .. }))
+                {
+                    awaiting_review = true;
+                }
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 engine.handle_event(Event::ReviewClosed { session });
                 break Ok(0);
@@ -494,7 +603,13 @@ fn run_tui(
 
 /// Draw the Review Pane; returns the stream viewport height so the engine
 /// can be told about resizes.
-fn draw(frame: &mut Frame, view: &ReviewView, input: &str) -> usize {
+fn draw(
+    frame: &mut Frame,
+    view: &ReviewView,
+    input: &str,
+    comment_input: Option<&CommentInput>,
+    awaiting_review: bool,
+) -> usize {
     let [header_area, mut body_area, footer_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -512,6 +627,22 @@ fn draw(frame: &mut Frame, view: &ReviewView, input: &str) -> usize {
         body_area = rest;
         draw_conversation(frame, conversation_area, conversation, input);
     }
+    if let Some(mode) = comment_input {
+        let [rest, comment_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .areas(body_area);
+        body_area = rest;
+        let title = match mode {
+            CommentInput::New => "Fix-it Comment",
+            CommentInput::Edit(_) => "edit Fix-it Comment",
+        };
+        frame.render_widget(
+            Paragraph::new(format!("> {input}▏"))
+                .block(Block::default().borders(Borders::TOP).title(title)),
+            comment_area,
+        );
+    }
     let sidebar_width = (body_area.width / 3).clamp(20, 40).min(body_area.width);
     let [sidebar_area, stream_area] = Layout::default()
         .direction(Direction::Horizontal)
@@ -519,10 +650,15 @@ fn draw(frame: &mut Frame, view: &ReviewView, input: &str) -> usize {
         .areas(body_area);
 
     let reviewed_files = view.files.iter().filter(|f| f.reviewed).count();
+    let status = if awaiting_review {
+        " — Review submitted, agent working…"
+    } else {
+        ""
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(
-                " Review: {} — {}/{} files reviewed",
+                " Review: {} — {}/{} files reviewed{status}",
                 view.worktree.0,
                 reviewed_files,
                 view.files.len()
@@ -537,8 +673,10 @@ fn draw(frame: &mut Frame, view: &ReviewView, input: &str) -> usize {
 
     let hints = if view.conversation.is_some() {
         " type your question · Enter ask · Esc close conversation"
+    } else if comment_input.is_some() {
+        " type your fix-it comment · Enter save draft · Esc cancel"
     } else {
-        " j/k move · C-d/C-u half page · [ ] hunk · { } file · m mark hunk · M mark file · c converse · q quit"
+        " j/k move · C-d/C-u half page · [ ] hunk · { } file · m/M mark · c converse · f fix-it · e edit · x delete · S submit · q quit"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -656,6 +794,12 @@ fn draw_stream(frame: &mut Frame, area: Rect, view: &ReviewView) -> usize {
                 } => (
                     format!("{header} {}", if *reviewed { "✓ reviewed" } else { "" }),
                     Style::default().fg(Color::Cyan),
+                ),
+                StreamRow::Comment { text, .. } => (
+                    format!("✎ {text}"),
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::ITALIC),
                 ),
                 StreamRow::Line { kind, content } => match kind {
                     DiffLineKind::Added => {
