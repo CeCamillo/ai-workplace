@@ -1,3 +1,4 @@
+use crate::conversation::ConversationRouting;
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
 use crate::review::{MarkTarget, ReviewMotion};
 use crate::worktree::AgentWorktree;
@@ -48,6 +49,26 @@ pub enum Event {
         session: AuthoringSessionId,
         target: MarkTarget,
     },
+    /// The human opened a Hunk Conversation on the hunk under the cursor.
+    /// No-op when the cursor is not on a hunk.
+    ConversationOpened { session: AuthoringSessionId },
+    /// The human closed the review's open Hunk Conversation.
+    ConversationClosed { session: AuthoringSessionId },
+    /// The human asked a question in the open Hunk Conversation. The first
+    /// question resolves the routing (ADR-0003): the live Authoring
+    /// Session when it exists, else a fresh seeded session.
+    ConversationAsked {
+        session: AuthoringSessionId,
+        question: String,
+    },
+    /// A session answered a conversation question. `target` is the session
+    /// the answer came from ([`Effect::ConversationRouted`]'s target), so
+    /// an answer outliving its conversation cannot attach to another hunk.
+    ConversationAnswerReceived {
+        session: AuthoringSessionId,
+        target: AuthoringSessionId,
+        answer: String,
+    },
 }
 
 /// Something the engine wants the host to do in response to an [`Event`].
@@ -81,6 +102,21 @@ pub enum Effect {
     },
     /// The review could not open; surface the message to the human.
     ReviewOpenFailed {
+        session: AuthoringSessionId,
+        message: String,
+    },
+    /// A conversation question was delivered to `target` — the live
+    /// Authoring Session, or the seeded stand-in the engine had the
+    /// AgentPort spawn. The answer must come back as
+    /// [`Event::ConversationAnswerReceived`].
+    ConversationRouted {
+        session: AuthoringSessionId,
+        target: AuthoringSessionId,
+        routing: ConversationRouting,
+    },
+    /// The conversation question could not be delivered (e.g. the seeded
+    /// session failed to spawn); surface the message to the human.
+    ConversationFailed {
         session: AuthoringSessionId,
         message: String,
     },

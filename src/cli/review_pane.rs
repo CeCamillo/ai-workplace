@@ -4,28 +4,48 @@
 //! core stays untouched. All review state lives in the Review Loop Engine;
 //! this binary reads keys, feeds engine events, and draws the render model.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use review_engine::{
-    AgentPort, AuthoringSessionId, DiffLineKind, Effect, Engine, Event, MarkTarget, RenderModel,
-    ReviewMotion, ReviewView, StreamRow, UiPort,
+    AgentPort, AuthoringSessionId, ConversationEntry, ConversationRouting, ConversationView,
+    DiffLineKind, Effect, Engine, Event, MarkTarget, RenderModel, ReviewMotion, ReviewView,
+    SessionSeed, StreamRow, UiPort,
 };
+
+use crate::api::client::ApiClient;
+use crate::api::schema::{EmptyParams, Method, Request};
 
 const USAGE: &str = "usage: herdr review-pane --worktree <path>";
 
-/// The read side of the Claude Code Harness Adapter: Annotations come from
-/// the product state store that `herdr annotate` (the write side, run by
-/// the agent at authoring time) filled — so they survive detach/reattach
-/// and session death. Conversations are a later loop stage; every
-/// Authoring Session still looks gone from here.
+/// A Hunk Conversation answer produced by a background `claude -p` run,
+/// handed back to the TUI loop over a channel.
+struct ConversationAnswer {
+    /// The engine-side session the question was delivered to.
+    target: AuthoringSessionId,
+    /// The claude session that answered, so follow-ups can `--resume` it
+    /// and keep the conversation's own history.
+    claude_session: Option<String>,
+    text: String,
+}
+
+/// The Claude Code Harness Adapter as seen from the Review Pane process.
+/// Annotations come from the product state store that `herdr annotate`
+/// (the write side, run by the agent at authoring time) filled — so they
+/// survive detach/reattach and session death. Conversations route per
+/// ADR-0003: the live Authoring Session is found through the herdr API
+/// (the claude pane working in this worktree) and reached with
+/// `claude -p --resume`; when it is gone, a fresh `claude -p` session is
+/// spawned seeded with the stored Annotation and hunk diff.
 struct StoreAgentPort {
     store: crate::annotation_store::AnnotationStore,
     repo_root: PathBuf,
@@ -35,14 +55,102 @@ struct StoreAgentPort {
     /// stale snapshot from pane launch.
     worktree: PathBuf,
     drained: bool,
+    router: ConversationRouter,
+}
+
+/// The adapter's conversation routing state: where answers go, the seed
+/// prompts of spawned sessions not yet primed by a first question, and
+/// which claude session continues each engine-side one.
+struct ConversationRouter {
+    answers: Sender<ConversationAnswer>,
+    seeds: HashMap<AuthoringSessionId, String>,
+    continuations: HashMap<AuthoringSessionId, String>,
+    seeded_count: usize,
+}
+
+impl ConversationRouter {
+    fn new(answers: Sender<ConversationAnswer>) -> Self {
+        Self {
+            answers,
+            seeds: HashMap::new(),
+            continuations: HashMap::new(),
+            seeded_count: 0,
+        }
+    }
+
+    /// Record which claude session answered for `target`; follow-up
+    /// questions `--resume` it.
+    fn record_claude_session(&mut self, target: &AuthoringSessionId, claude_session: String) {
+        self.continuations.insert(target.clone(), claude_session);
+    }
+
+    fn fail(&self, target: &AuthoringSessionId, message: String) {
+        tracing::warn!(target = %target.0, %message, "hunk conversation went unanswered");
+        self.answers
+            .send(ConversationAnswer {
+                target: target.clone(),
+                claude_session: None,
+                text: no_answer(&message),
+            })
+            .ok();
+    }
+}
+
+/// The transcript entry a delivery failure turns into, in place of the
+/// answer.
+fn no_answer(message: &str) -> String {
+    format!("(no answer: {message})")
 }
 
 impl AgentPort for StoreAgentPort {
     fn session_is_live(&self, _session: &AuthoringSessionId) -> bool {
-        false
+        live_authoring_claude_session(&self.worktree).is_some()
     }
 
-    fn deliver_instructions(&mut self, _session: &AuthoringSessionId, _instructions: &str) {}
+    fn deliver_instructions(&mut self, session: &AuthoringSessionId, instructions: &str) {
+        let resolved = if let Some(claude_session) = self.router.continuations.get(session) {
+            Ok((Some(claude_session.clone()), instructions.to_string()))
+        } else if let Some(seed) = self.router.seeds.remove(session) {
+            Ok((None, format!("{seed}\n\n{instructions}")))
+        } else {
+            match live_authoring_claude_session(&self.worktree) {
+                Some(claude_session) => Ok((Some(claude_session), instructions.to_string())),
+                None => Err(
+                    "the Authoring Session disappeared before the question was delivered"
+                        .to_string(),
+                ),
+            }
+        };
+        let (resume, prompt) = match resolved {
+            Ok(resolved) => resolved,
+            Err(message) => return self.router.fail(session, message),
+        };
+        let target = session.clone();
+        let worktree = self.worktree.clone();
+        let answers = self.router.answers.clone();
+        std::thread::spawn(move || {
+            let answer = match run_claude_print(&worktree, resume.as_deref(), &prompt) {
+                Ok((text, claude_session)) => ConversationAnswer {
+                    target,
+                    claude_session,
+                    text,
+                },
+                Err(message) => {
+                    tracing::warn!(
+                        target = %target.0,
+                        %message,
+                        "hunk conversation went unanswered"
+                    );
+                    ConversationAnswer {
+                        target,
+                        claude_session: None,
+                        text: no_answer(&message),
+                    }
+                }
+            };
+            answers.send(answer).ok();
+        });
+    }
 
     fn take_annotations(
         &mut self,
@@ -60,6 +168,110 @@ impl AgentPort for StoreAgentPort {
         self.store
             .annotations_for(&self.repo_root, &self.branch, &base)
     }
+
+    fn spawn_seeded_session(&mut self, seed: &SessionSeed) -> Result<AuthoringSessionId, String> {
+        self.router.seeded_count += 1;
+        let session = AuthoringSessionId(format!("review-seeded-{}", self.router.seeded_count));
+        self.router.seeds.insert(session.clone(), seed_prompt(seed));
+        Ok(session)
+    }
+}
+
+/// The context a fresh session gets in place of the gone Authoring
+/// Session's memory: the hunk diff and the stored Annotations (ADR-0003).
+fn seed_prompt(seed: &SessionSeed) -> String {
+    let mut prompt = format!(
+        "You are answering a code reviewer's questions about a change whose \
+         authoring agent session is gone. The hunk under discussion, from \
+         {}:\n\n{}\n",
+        seed.file, seed.diff
+    );
+    for annotation in &seed.annotations {
+        prompt.push_str(&format!(
+            "\nThe authoring agent annotated this hunk — what: {} — why: {}\n",
+            annotation.what, annotation.why
+        ));
+    }
+    prompt.push_str(
+        "\nAnswer the reviewer concisely in plain text, using the repository \
+         for extra context where needed.",
+    );
+    prompt
+}
+
+/// The claude session of the live Authoring Session working in `worktree`,
+/// found through the herdr API: a claude agent pane whose working
+/// directory is the worktree and which is interactively ready.
+fn live_authoring_claude_session(worktree: &Path) -> Option<String> {
+    let worktree = worktree
+        .canonicalize()
+        .unwrap_or_else(|_| worktree.to_path_buf());
+    let response = ApiClient::local()
+        .request_value_with_timeout(
+            &Request {
+                id: "review-pane:agent-list".into(),
+                method: Method::AgentList(EmptyParams::default()),
+            },
+            Duration::from_secs(2),
+        )
+        .ok()?;
+    let agents = response["result"]["agents"].as_array()?;
+    agents.iter().find_map(|agent| {
+        if agent["agent"].as_str() != Some("claude")
+            || !agent["interactive_ready"].as_bool().unwrap_or(false)
+        {
+            return None;
+        }
+        let in_worktree = [&agent["cwd"], &agent["foreground_cwd"]]
+            .iter()
+            .filter_map(|cwd| cwd.as_str())
+            .any(|cwd| {
+                let cwd = Path::new(cwd);
+                cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()) == worktree
+            });
+        if !in_worktree {
+            return None;
+        }
+        let session = &agent["agent_session"];
+        (session["agent"].as_str() == Some("claude") && session["kind"].as_str() == Some("id"))
+            .then(|| session["value"].as_str().map(str::to_string))
+            .flatten()
+    })
+}
+
+/// Run one non-interactive claude turn in the worktree and return
+/// `(answer, claude session id)`. `resume` continues an existing session —
+/// the live Authoring Session's memory, or an earlier conversation turn.
+fn run_claude_print(
+    worktree: &Path,
+    resume: Option<&str>,
+    prompt: &str,
+) -> Result<(String, Option<String>), String> {
+    let mut command = std::process::Command::new("claude");
+    command
+        .current_dir(worktree)
+        .args(["-p", "--output-format", "json"]);
+    if let Some(session) = resume {
+        command.args(["--resume", session]);
+    }
+    let output = command
+        .arg(prompt)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|err| format!("could not run claude: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("claude failed: {}", stderr.trim()));
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("claude output was not json: {err}"))?;
+    let text = parsed["result"]
+        .as_str()
+        .ok_or_else(|| "claude output had no result".to_string())?
+        .trim()
+        .to_string();
+    let claude_session = parsed["session_id"].as_str().map(str::to_string);
+    Ok((text, claude_session))
 }
 
 /// Keeps the engine's latest render model for the draw loop.
@@ -98,7 +310,7 @@ pub(super) fn run_review_pane_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     match open_review(&worktree) {
-        Ok(engine) => run_tui(engine),
+        Ok((engine, answers)) => run_tui(engine, answers),
         Err(message) => {
             eprintln!("cannot open review: {message}");
             // Keep the failure on screen: this process is a pane the user
@@ -116,18 +328,20 @@ type ReviewEngine = Engine<StoreAgentPort, review_engine::git::SystemGitPort, La
 
 /// Adopt the worktree through the engine and open the review on it. The
 /// engine's own guards apply: the primary checkout is not an Agent Worktree.
-fn open_review(worktree: &Path) -> Result<ReviewEngine, String> {
+fn open_review(worktree: &Path) -> Result<(ReviewEngine, Receiver<ConversationAnswer>), String> {
     // The same resolution `herdr annotate` keys its writes with, so the
     // two adapter halves can never disagree on the store file.
     let identity = super::worktree_identity::resolve_worktree_identity(worktree)?;
     let branch = identity.branch;
     let worktrees_root = identity.repo_root.join(".herdr-agent-worktrees");
+    let (answers_tx, answers_rx) = channel();
     let agent = StoreAgentPort {
         store: crate::annotation_store::AnnotationStore::product(),
         repo_root: identity.repo_root.clone(),
         branch: branch.clone(),
         worktree: worktree.to_path_buf(),
         drained: false,
+        router: ConversationRouter::new(answers_tx),
     };
     let git = review_engine::git::SystemGitPort::new(identity.repo_root, worktrees_root);
     let mut engine = Engine::new(agent, git, LatestRender::default());
@@ -144,27 +358,45 @@ fn open_review(worktree: &Path) -> Result<ReviewEngine, String> {
     if let [Effect::ReviewOpenFailed { message, .. }] = effects.as_slice() {
         return Err(message.clone());
     }
-    Ok(engine)
+    Ok((engine, answers_rx))
 }
 
 fn session_of(engine: &ReviewEngine) -> Option<AuthoringSessionId> {
     engine.ui().model.reviews.first().map(|r| r.session.clone())
 }
 
-fn run_tui(mut engine: ReviewEngine) -> std::io::Result<i32> {
+fn run_tui(
+    mut engine: ReviewEngine,
+    answers: Receiver<ConversationAnswer>,
+) -> std::io::Result<i32> {
     let Some(session) = session_of(&engine) else {
         eprintln!("cannot open review: the engine reported no open review");
         return Ok(1);
     };
     let mut terminal = ratatui::init();
     let mut viewport_rows = 0usize;
+    // The question being typed: TUI presentation state, not engine state.
+    let mut input = String::new();
     let result = loop {
+        while let Ok(answer) = answers.try_recv() {
+            if let Some(claude_session) = answer.claude_session {
+                engine
+                    .agent_mut()
+                    .router
+                    .record_claude_session(&answer.target, claude_session);
+            }
+            engine.handle_event(Event::ConversationAnswerReceived {
+                session: session.clone(),
+                target: answer.target,
+                answer: answer.text,
+            });
+        }
         let Some(view) = engine.ui().model.reviews.first().cloned() else {
             break Ok(0);
         };
         let mut stream_rows = 0usize;
         if let Err(err) = terminal.draw(|frame| {
-            stream_rows = draw(frame, &view);
+            stream_rows = draw(frame, &view, &input);
         }) {
             break Err(err);
         }
@@ -187,6 +419,32 @@ fn run_tui(mut engine: ReviewEngine) -> std::io::Result<i32> {
             continue;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // An open conversation captures the keyboard for its question box.
+        if let Some(conversation) = view.conversation.as_ref() {
+            match key.code {
+                KeyCode::Esc => {
+                    input.clear();
+                    engine.handle_event(Event::ConversationClosed {
+                        session: session.clone(),
+                    });
+                }
+                KeyCode::Enter if !conversation.awaiting_answer && !input.trim().is_empty() => {
+                    let question = std::mem::take(&mut input);
+                    // A failed ask joins the transcript engine-side; no
+                    // effect handling needed here.
+                    engine.handle_event(Event::ConversationAsked {
+                        session: session.clone(),
+                        question,
+                    });
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if !ctrl => input.push(c),
+                _ => {}
+            }
+            continue;
+        }
         let motion = match key.code {
             KeyCode::Char('j') | KeyCode::Down => Some(ReviewMotion::LineDown),
             KeyCode::Char('k') | KeyCode::Up => Some(ReviewMotion::LineUp),
@@ -218,6 +476,11 @@ fn run_tui(mut engine: ReviewEngine) -> std::io::Result<i32> {
                     target: MarkTarget::File,
                 });
             }
+            KeyCode::Char('c') => {
+                engine.handle_event(Event::ConversationOpened {
+                    session: session.clone(),
+                });
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 engine.handle_event(Event::ReviewClosed { session });
                 break Ok(0);
@@ -231,8 +494,8 @@ fn run_tui(mut engine: ReviewEngine) -> std::io::Result<i32> {
 
 /// Draw the Review Pane; returns the stream viewport height so the engine
 /// can be told about resizes.
-fn draw(frame: &mut Frame, view: &ReviewView) -> usize {
-    let [header_area, body_area, footer_area] = Layout::default()
+fn draw(frame: &mut Frame, view: &ReviewView, input: &str) -> usize {
+    let [header_area, mut body_area, footer_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
@@ -240,6 +503,15 @@ fn draw(frame: &mut Frame, view: &ReviewView) -> usize {
             Constraint::Length(1),
         ])
         .areas(frame.area());
+    if let Some(conversation) = view.conversation.as_ref() {
+        let height = (conversation.entries.len() as u16 * 2 + 5).clamp(7, body_area.height / 2);
+        let [rest, conversation_area] = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(height)])
+            .areas(body_area);
+        body_area = rest;
+        draw_conversation(frame, conversation_area, conversation, input);
+    }
     let sidebar_width = (body_area.width / 3).clamp(20, 40).min(body_area.width);
     let [sidebar_area, stream_area] = Layout::default()
         .direction(Direction::Horizontal)
@@ -263,14 +535,65 @@ fn draw(frame: &mut Frame, view: &ReviewView) -> usize {
     draw_file_sidebar(frame, sidebar_area, view);
     let stream_rows = draw_stream(frame, stream_area, view);
 
+    let hints = if view.conversation.is_some() {
+        " type your question · Enter ask · Esc close conversation"
+    } else {
+        " j/k move · C-d/C-u half page · [ ] hunk · { } file · m mark hunk · M mark file · c converse · q quit"
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " j/k move · C-d/C-u half page · [ ] hunk · { } file · m mark hunk · M mark file · q quit",
+            hints,
             Style::default().fg(Color::DarkGray),
         ))),
         footer_area,
     );
     stream_rows
+}
+
+/// Draw the open Hunk Conversation: the exchange so far and the question
+/// box, anchored under the stream.
+fn draw_conversation(frame: &mut Frame, area: Rect, conversation: &ConversationView, input: &str) {
+    let routing = match conversation.routing {
+        None => "unrouted",
+        Some(ConversationRouting::LiveAuthoringSession) => "live Authoring Session",
+        Some(ConversationRouting::SeededSession) => "fresh seeded session",
+    };
+    let title = format!(
+        " conversation · {} {} · {routing} ",
+        conversation.file, conversation.hunk_header
+    );
+    let mut lines: Vec<Line> = Vec::new();
+    for entry in &conversation.entries {
+        lines.push(match entry {
+            ConversationEntry::Question(question) => Line::from(Span::styled(
+                format!("you ▸ {question}"),
+                Style::default().fg(Color::Cyan),
+            )),
+            ConversationEntry::Answer(answer) => Line::from(Span::styled(
+                format!("agent ▸ {answer}"),
+                Style::default().fg(Color::Yellow),
+            )),
+        });
+    }
+    if conversation.awaiting_answer {
+        lines.push(Line::from(Span::styled(
+            "agent ▸ thinking…",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("> {input}▏"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::TOP).title(title)),
+        area,
+    );
 }
 
 fn draw_file_sidebar(frame: &mut Frame, area: Rect, view: &ReviewView) {
@@ -411,12 +734,14 @@ mod tests {
             )
             .unwrap();
 
+        let (answers, _keep_alive) = channel();
         let mut port = StoreAgentPort {
             store,
             repo_root: repo.clone(),
             branch: "agent/pane-1".to_string(),
             worktree: repo,
             drained: false,
+            router: ConversationRouter::new(answers),
         };
         let session = AuthoringSessionId::from("agent/pane-1");
         let drained = port.take_annotations(&session);
@@ -428,5 +753,57 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The seeded conversation path against the real CLI: one `claude -p`
+    /// turn seeded with a hunk answers a question about it, and the
+    /// reported session id resumes into a follow-up that still remembers
+    /// the exchange. Opt in with `--ignored` — it needs the `claude` CLI
+    /// and API access.
+    #[test]
+    #[ignore = "round-trips real claude -p turns; needs `claude` on PATH and API access"]
+    fn a_real_seeded_claude_session_answers_and_resumes() {
+        if Command::new("claude").arg("--version").output().is_err() {
+            eprintln!("skipping: claude CLI not found on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("herdr-conversation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let seed = SessionSeed {
+            file: "src/lib.rs".to_string(),
+            hunk_header: "@@ -1,1 +1,1 @@".to_string(),
+            diff: "@@ -1,1 +1,1 @@\n-mod parser;\n+mod zephyr_parser;".to_string(),
+            annotations: vec![review_engine::Annotation {
+                file: "src/lib.rs".to_string(),
+                line: 1,
+                what: "rename the parser module".to_string(),
+                why: "the old name collided with a dependency".to_string(),
+            }],
+        };
+        let question = format!(
+            "{}\n\nWhat is the exact name of the module the hunk adds?",
+            seed_prompt(&seed)
+        );
+        let (answer, claude_session) =
+            run_claude_print(&dir, None, &question).expect("the seeded turn should answer");
+        assert!(
+            answer.contains("zephyr_parser"),
+            "the answer should come from the seeded hunk, got: {answer}"
+        );
+
+        let claude_session = claude_session.expect("claude should report a session_id to resume");
+        let (follow_up, _) = run_claude_print(
+            &dir,
+            Some(&claude_session),
+            "Answer again with exactly the module name from my previous question, nothing else.",
+        )
+        .expect("the resumed follow-up should answer");
+        assert!(
+            follow_up.contains("zephyr_parser"),
+            "the follow-up should remember the conversation, got: {follow_up}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

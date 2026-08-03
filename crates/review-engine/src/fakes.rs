@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::annotation::Annotation;
+use crate::conversation::SessionSeed;
 use crate::diff::Changeset;
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
 use crate::ports::{AgentPort, GitPort, RenderModel, UiPort};
@@ -17,6 +18,8 @@ pub struct FakeAgentPort {
     live: HashSet<AuthoringSessionId>,
     delivered: Vec<(AuthoringSessionId, String)>,
     pending_annotations: HashMap<AuthoringSessionId, Vec<Annotation>>,
+    spawned: Vec<SessionSeed>,
+    fail_next_spawn: Option<String>,
 }
 
 impl FakeAgentPort {
@@ -39,6 +42,17 @@ impl FakeAgentPort {
             .or_default()
             .push(annotation);
     }
+
+    /// The seeds of every seeded session spawned, in spawn order. Spawn `n`
+    /// got the id `seeded-<n>`, 1-based.
+    pub fn spawned(&self) -> &[SessionSeed] {
+        &self.spawned
+    }
+
+    /// Make the next seeded-session spawn fail with this message.
+    pub fn fail_next_spawn(&mut self, message: String) {
+        self.fail_next_spawn = Some(message);
+    }
 }
 
 impl AgentPort for FakeAgentPort {
@@ -53,6 +67,14 @@ impl AgentPort for FakeAgentPort {
 
     fn take_annotations(&mut self, session: &AuthoringSessionId) -> Vec<Annotation> {
         self.pending_annotations.remove(session).unwrap_or_default()
+    }
+
+    fn spawn_seeded_session(&mut self, seed: &SessionSeed) -> Result<AuthoringSessionId, String> {
+        if let Some(message) = self.fail_next_spawn.take() {
+            return Err(message);
+        }
+        self.spawned.push(seed.clone());
+        Ok(AuthoringSessionId(format!("seeded-{}", self.spawned.len())))
     }
 }
 
