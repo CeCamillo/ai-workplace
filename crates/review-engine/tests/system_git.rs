@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use review_engine::git::SystemGitPort;
-use review_engine::{AuthoringSessionId, DiffLineKind, GitPort};
+use review_engine::{AuthoringSessionId, DiffLineKind, GitPort, MergeOutcome};
 
 static NEXT_TEMP_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -120,6 +120,86 @@ fn changeset_diff_covers_modified_and_untracked_files_without_staging_them() {
     // Intent-to-add must not stage content: a later discard still wipes it.
     port.discard_worktree(&worktree).unwrap();
     assert!(!worktree.path.join("new.rs").exists());
+
+    std::fs::remove_dir_all(repo.parent().unwrap().parent().unwrap()).ok();
+}
+
+#[test]
+fn merge_into_default_lands_the_branch_and_remove_cleans_up() {
+    let (repo, mut port) = repo_and_port("merge");
+    let session = AuthoringSessionId::from("pane-1");
+    let worktree = port.create_worktree(&session).unwrap();
+
+    // The agent committed its work on the branch.
+    std::fs::write(worktree.path.join("feature.rs"), "pub fn f() {}\n").unwrap();
+    run_git(&worktree.path, &["add", "."]);
+    run_git(&worktree.path, &["commit", "-m", "add feature"]);
+    // The default branch moved on independently (no conflict).
+    std::fs::write(repo.join("other.rs"), "pub fn o() {}\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "other work"]);
+
+    let outcome = port.merge_into_default(&worktree).unwrap();
+
+    assert_eq!(outcome, MergeOutcome::Merged);
+    assert!(
+        repo.join("feature.rs").exists(),
+        "the default branch has the agent's work"
+    );
+    assert!(
+        repo.join("other.rs").exists(),
+        "the default branch keeps its own work"
+    );
+
+    port.remove_worktree(&worktree).unwrap();
+    assert!(!worktree.path.exists(), "the worktree directory is gone");
+    let listing = git_stdout(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(!listing.contains("agent/pane-1"));
+    let branches = git_stdout(&repo, &["branch", "--list", "agent/pane-1"]);
+    assert_eq!(branches.trim(), "", "the branch is deleted");
+
+    std::fs::remove_dir_all(repo.parent().unwrap().parent().unwrap()).ok();
+}
+
+#[test]
+fn a_conflicting_merge_is_left_in_progress_in_the_worktree_and_resolvable() {
+    let (repo, mut port) = repo_and_port("merge-conflict");
+    let session = AuthoringSessionId::from("pane-1");
+    let worktree = port.create_worktree(&session).unwrap();
+
+    // Both sides edit the same line of README.md.
+    std::fs::write(worktree.path.join("README.md"), "agent version\n").unwrap();
+    run_git(&worktree.path, &["add", "."]);
+    run_git(&worktree.path, &["commit", "-m", "agent edit"]);
+    std::fs::write(repo.join("README.md"), "human version\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "human edit"]);
+
+    let outcome = port.merge_into_default(&worktree).unwrap();
+
+    assert_eq!(
+        outcome,
+        MergeOutcome::Conflicts {
+            files: vec!["README.md".to_string()],
+        }
+    );
+    // The conflicted merge is in progress in the worktree, not the repo.
+    assert!(worktree.path.join(".git").exists());
+    let status = git_stdout(&worktree.path, &["status", "--porcelain"]);
+    assert!(status.contains("UU README.md"), "got status: {status}");
+    let repo_status = git_stdout(&repo, &["status", "--porcelain"]);
+    assert_eq!(repo_status, "", "the primary working tree stays clean");
+
+    // The agent resolves and concludes the merge; the retry completes.
+    std::fs::write(worktree.path.join("README.md"), "merged version\n").unwrap();
+    run_git(&worktree.path, &["add", "README.md"]);
+    run_git(&worktree.path, &["commit", "--no-edit"]);
+    let outcome = port.merge_into_default(&worktree).unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).unwrap(),
+        "merged version\n"
+    );
 
     std::fs::remove_dir_all(repo.parent().unwrap().parent().unwrap()).ok();
 }

@@ -282,6 +282,50 @@ enum CommentInput {
     Edit(usize),
 }
 
+/// Which agent turn the pane is waiting on. While one is out, the answers
+/// channel's completed `claude -p` turn means "the agent finished" and
+/// advances the engine.
+enum AwaitingTurn {
+    /// The submitted Review is being applied.
+    Review,
+    /// The Approve commit instruction is being carried out.
+    Commit,
+    /// Handed-off merge conflicts are being resolved.
+    ConflictResolution,
+}
+
+impl AwaitingTurn {
+    fn label(&self) -> &'static str {
+        match self {
+            AwaitingTurn::Review => " — Review submitted, agent working…",
+            AwaitingTurn::Commit => " — Approved, agent committing…",
+            AwaitingTurn::ConflictResolution => " — merge conflicts with the agent…",
+        }
+    }
+}
+
+/// Track the approve/commit/merge flow across an event's effects: which
+/// agent turn is now pending, and any failure to surface in the header.
+fn apply_flow_effects(
+    effects: &[Effect],
+    awaiting: &mut Option<AwaitingTurn>,
+    notice: &mut Option<String>,
+) {
+    for effect in effects {
+        match effect {
+            Effect::ReviewDelivered { .. } => *awaiting = Some(AwaitingTurn::Review),
+            Effect::CommitRequested { .. } => *awaiting = Some(AwaitingTurn::Commit),
+            Effect::MergeConflictsHandedToAgent { .. } => {
+                *awaiting = Some(AwaitingTurn::ConflictResolution)
+            }
+            Effect::CommitFailed { message, .. }
+            | Effect::MergeFailed { message, .. }
+            | Effect::WorktreeOperationFailed { message, .. } => *notice = Some(message.clone()),
+            _ => {}
+        }
+    }
+}
+
 /// Keeps the engine's latest render model for the draw loop.
 #[derive(Default)]
 struct LatestRender {
@@ -387,9 +431,12 @@ fn run_tui(
     // owns it: TUI presentation state, not engine state.
     let mut input = String::new();
     let mut comment_input: Option<CommentInput> = None;
-    // A submitted Review is out with the agent; its completed `claude -p`
-    // turn comes back on the answers channel and means "the agent acted".
-    let mut awaiting_review = false;
+    // An instruction set (a Review, a commit, a conflict hand-off) is out
+    // with the agent; its completed `claude -p` turn comes back on the
+    // answers channel and means "the agent acted".
+    let mut awaiting: Option<AwaitingTurn> = None;
+    // The last flow failure, drawn in the header until the flow moves on.
+    let mut notice: Option<String> = None;
     let result = loop {
         while let Ok(answer) = answers.try_recv() {
             if let Some(claude_session) = answer.claude_session {
@@ -412,11 +459,13 @@ fn run_tui(
                     conversation.awaiting_answer
                         && conversation.routing == Some(ConversationRouting::LiveAuthoringSession)
                 });
-            if awaiting_review && answer.target == session && !live_conversation_awaiting {
-                awaiting_review = false;
-                engine.handle_event(Event::AgentFinished {
+            if awaiting.is_some() && answer.target == session && !live_conversation_awaiting {
+                awaiting = None;
+                notice = None;
+                let effects = engine.handle_event(Event::AgentFinished {
                     session: session.clone(),
                 });
+                apply_flow_effects(&effects, &mut awaiting, &mut notice);
                 continue;
             }
             engine.handle_event(Event::ConversationAnswerReceived {
@@ -428,6 +477,19 @@ fn run_tui(
         let Some(view) = engine.ui().model.reviews.first().cloned() else {
             break Ok(0);
         };
+        let merge_offered = engine.ui().model.merge_offers.contains(&session);
+        let mut status = awaiting
+            .as_ref()
+            .map(AwaitingTurn::label)
+            .unwrap_or(if merge_offered {
+                " — committed · merge into the default branch? y/n"
+            } else {
+                ""
+            })
+            .to_string();
+        if let Some(notice) = notice.as_ref() {
+            status.push_str(&format!(" — {notice}"));
+        }
         let mut stream_rows = 0usize;
         if let Err(err) = terminal.draw(|frame| {
             stream_rows = draw(
@@ -435,7 +497,8 @@ fn run_tui(
                 &view,
                 &input,
                 comment_input.as_ref(),
-                awaiting_review,
+                &status,
+                merge_offered,
             );
         }) {
             break Err(err);
@@ -583,12 +646,24 @@ fn run_tui(
                 let effects = engine.handle_event(Event::ReviewSubmitted {
                     session: session.clone(),
                 });
-                if effects
-                    .iter()
-                    .any(|effect| matches!(effect, Effect::ReviewDelivered { .. }))
-                {
-                    awaiting_review = true;
-                }
+                apply_flow_effects(&effects, &mut awaiting, &mut notice);
+            }
+            KeyCode::Char('A') if awaiting.is_none() && !merge_offered => {
+                let effects = engine.handle_event(Event::ChangesetApproved {
+                    session: session.clone(),
+                });
+                apply_flow_effects(&effects, &mut awaiting, &mut notice);
+            }
+            KeyCode::Char('y') if merge_offered => {
+                let effects = engine.handle_event(Event::MergeAccepted {
+                    session: session.clone(),
+                });
+                apply_flow_effects(&effects, &mut awaiting, &mut notice);
+            }
+            KeyCode::Char('n') if merge_offered => {
+                engine.handle_event(Event::MergeDeclined {
+                    session: session.clone(),
+                });
             }
             KeyCode::Char('q') | KeyCode::Esc => {
                 engine.handle_event(Event::ReviewClosed { session });
@@ -608,7 +683,8 @@ fn draw(
     view: &ReviewView,
     input: &str,
     comment_input: Option<&CommentInput>,
-    awaiting_review: bool,
+    status: &str,
+    merge_offered: bool,
 ) -> usize {
     let [header_area, mut body_area, footer_area] = Layout::default()
         .direction(Direction::Vertical)
@@ -650,11 +726,6 @@ fn draw(
         .areas(body_area);
 
     let reviewed_files = view.files.iter().filter(|f| f.reviewed).count();
-    let status = if awaiting_review {
-        " — Review submitted, agent working…"
-    } else {
-        ""
-    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(
@@ -675,8 +746,10 @@ fn draw(
         " type your question · Enter ask · Esc close conversation"
     } else if comment_input.is_some() {
         " type your fix-it comment · Enter save draft · Esc cancel"
+    } else if merge_offered {
+        " y merge into the default branch · n keep the branch as-is · q quit"
     } else {
-        " j/k move · C-d/C-u half page · [ ] hunk · { } file · m/M mark · c converse · f fix-it · e edit · x delete · S submit · q quit"
+        " j/k move · C-d/C-u half page · [ ] hunk · { } file · m/M mark · c converse · f fix-it · e edit · x delete · S submit · A approve · q quit"
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(

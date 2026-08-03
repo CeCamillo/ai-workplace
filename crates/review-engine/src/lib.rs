@@ -29,7 +29,7 @@ pub use diff::{parse_unified_diff, Changeset, DiffLine, DiffLineKind, FileDiff, 
 pub use engine::Engine;
 pub use event::{Effect, Event, WorktreeSpawn};
 pub use ids::{AgentWorktreeId, AuthoringSessionId};
-pub use ports::{AgentPort, GitPort, RenderModel, UiPort};
+pub use ports::{AgentPort, GitPort, MergeOutcome, RenderModel, UiPort};
 pub use review::{
     FileSummary, MarkTarget, ReviewMotion, ReviewView, ReviewedMarks, ReviewedMarksSnapshot,
     StreamRow,

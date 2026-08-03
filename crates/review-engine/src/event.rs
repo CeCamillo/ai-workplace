@@ -90,6 +90,16 @@ pub enum Event {
     /// structured instruction set and deliver it to the Agent. No-op when
     /// there are no drafts.
     ReviewSubmitted { session: AuthoringSessionId },
+    /// The human Approved the changeset: instruct the Agent to commit it on
+    /// its Agent Worktree branch, authoring the commit message itself.
+    ChangesetApproved { session: AuthoringSessionId },
+    /// The human took the one-keypress merge offer: merge the branch into
+    /// the default branch. No-op without an open offer.
+    MergeAccepted { session: AuthoringSessionId },
+    /// The human declined the merge offer: the branch is left as-is (to
+    /// stack on or PR through their own workflow). No-op without an open
+    /// offer.
+    MergeDeclined { session: AuthoringSessionId },
 }
 
 /// Something the engine wants the host to do in response to an [`Event`].
@@ -151,5 +161,39 @@ pub enum Effect {
     ReviewRefreshFailed {
         session: AuthoringSessionId,
         message: String,
+    },
+    /// Approve instructed the Agent to commit its changeset; the commit
+    /// lands when the agent next finishes.
+    CommitRequested { session: AuthoringSessionId },
+    /// The agent finished after the commit instruction but the changeset
+    /// is not committed; surface the message to the human. The approval is
+    /// void — the session is Ready-for-Review again.
+    CommitFailed {
+        session: AuthoringSessionId,
+        message: String,
+    },
+    /// The approved changeset is committed on `branch`: offer the human the
+    /// one-keypress merge to the default branch.
+    MergeOffered {
+        session: AuthoringSessionId,
+        branch: String,
+    },
+    /// The merge hit conflicts; they were handed to the agent to resolve,
+    /// with the conflicted merge left in progress in its worktree.
+    MergeConflictsHandedToAgent {
+        session: AuthoringSessionId,
+        files: Vec<String>,
+    },
+    /// The merge could not run at all (distinct from conflicts); surface
+    /// the message. The offer stays open for a retry.
+    MergeFailed {
+        session: AuthoringSessionId,
+        message: String,
+    },
+    /// The branch is merged into the default branch and the Agent Worktree
+    /// is cleaned up; the loop is over for this changeset.
+    MergeCompleted {
+        session: AuthoringSessionId,
+        worktree: AgentWorktreeId,
     },
 }
