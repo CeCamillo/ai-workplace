@@ -5,9 +5,25 @@ use crate::conversation::{ConversationEntry, ConversationRouting};
 use crate::diff::Changeset;
 use crate::event::{Effect, Event, WorktreeSpawn};
 use crate::ids::AuthoringSessionId;
-use crate::ports::{AgentPort, GitPort, RenderModel, UiPort};
+use crate::ports::{AgentPort, GitPort, MergeOutcome, RenderModel, UiPort};
 use crate::review::{MarkTarget, ReviewState, ReviewedMarksSnapshot};
 use crate::worktree::AgentWorktree;
+
+/// Where a session's Approve stands. Approve is the loop's exit: commit
+/// instruction out → commit lands → merge offer → merged (with conflict
+/// hand-offs in between) or declined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalPhase {
+    /// The commit instruction is with the agent; the commit lands when the
+    /// agent next finishes. `base` is the branch head at approval, so a
+    /// landed commit is observable — not inferred from a clean tree alone.
+    AwaitingCommit { base: String },
+    /// The changeset is committed; the one-keypress merge offer is open.
+    MergeOffered,
+    /// The merge conflicted and the conflicts are with the agent; the merge
+    /// retries when the agent next finishes.
+    AwaitingConflictResolution,
+}
 
 /// The event-in/effect-out core of the Agent Review Loop.
 pub struct Engine<A: AgentPort, G: GitPort, U: UiPort> {
@@ -25,6 +41,8 @@ pub struct Engine<A: AgentPort, G: GitPort, U: UiPort> {
     /// Annotations, keyed by Agent Worktree and commit range so they outlive
     /// the Authoring Session that emitted them (ADR-0003).
     annotations: AnnotationsSnapshot,
+    /// Each session's in-flight Approve, if any.
+    approvals: HashMap<AuthoringSessionId, ApprovalPhase>,
 }
 
 impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
@@ -38,6 +56,7 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
             reviews: Vec::new(),
             marks: ReviewedMarksSnapshot::new(),
             annotations: AnnotationsSnapshot::new(),
+            approvals: HashMap::new(),
         }
     }
 
@@ -86,14 +105,7 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
     pub fn handle_event(&mut self, event: Event) -> Vec<Effect> {
         let effects = match event {
             Event::AgentPaneSpawned { session, worktree } => self.bind_worktree(session, worktree),
-            Event::AgentFinished { session } => {
-                self.model.ready_for_review.push(session.clone());
-                let mut effects = vec![Effect::ReadyForReview {
-                    session: session.clone(),
-                }];
-                effects.extend(self.refresh_review(&session));
-                effects
-            }
+            Event::AgentFinished { session } => self.agent_finished(session),
             Event::AnnotationsEmitted { session } => self.ingest_annotations(session),
             Event::ChangesetDiscarded { session } => self.discard_changeset(session),
             Event::ReviewRequested { session } => self.open_review(session),
@@ -149,6 +161,21 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
                 vec![]
             }
             Event::ReviewSubmitted { session } => self.submit_review(session),
+            Event::ChangesetApproved { session } => self.approve_changeset(session),
+            Event::MergeAccepted { session } => {
+                if self.approvals.get(&session) == Some(&ApprovalPhase::MergeOffered) {
+                    self.attempt_merge(session)
+                } else {
+                    vec![]
+                }
+            }
+            Event::MergeDeclined { session } => {
+                if self.approvals.get(&session) == Some(&ApprovalPhase::MergeOffered) {
+                    self.approvals.remove(&session);
+                    self.model.merge_offers.retain(|s| *s != session);
+                }
+                vec![]
+            }
         };
         self.render();
         effects
@@ -213,11 +240,9 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
     }
 
     fn ingest_annotations(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
-        let Some(worktree) = self.worktrees.get(&session).cloned() else {
-            return vec![Effect::WorktreeOperationFailed {
-                session,
-                message: "no Agent Worktree is bound to this session".to_string(),
-            }];
+        let worktree = match self.bound_worktree(&session) {
+            Ok(worktree) => worktree,
+            Err(effect) => return vec![effect],
         };
         // Resolve the commit-range key before draining: a failure here must
         // leave the annotations in the adapter, not lose them.
@@ -385,12 +410,22 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
         }
     }
 
-    fn discard_changeset(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
-        let Some(worktree) = self.worktrees.get(&session).cloned() else {
-            return vec![Effect::WorktreeOperationFailed {
-                session,
+    /// The session's bound Agent Worktree, or the failure effect every
+    /// worktree-scoped event surfaces without one.
+    fn bound_worktree(&self, session: &AuthoringSessionId) -> Result<AgentWorktree, Effect> {
+        self.worktrees
+            .get(session)
+            .cloned()
+            .ok_or_else(|| Effect::WorktreeOperationFailed {
+                session: session.clone(),
                 message: "no Agent Worktree is bound to this session".to_string(),
-            }];
+            })
+    }
+
+    fn discard_changeset(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
+        let worktree = match self.bound_worktree(&session) {
+            Ok(worktree) => worktree,
+            Err(effect) => return vec![effect],
         };
         match self.git.discard_worktree(&worktree) {
             Ok(()) => {
@@ -406,5 +441,167 @@ impl<A: AgentPort, G: GitPort, U: UiPort> Engine<A, G, U> {
             }
             Err(message) => vec![Effect::WorktreeOperationFailed { session, message }],
         }
+    }
+
+    /// The agent finished a turn. In an Approve, that turn is the loop
+    /// advancing — the commit landing or conflicts resolved; otherwise it is
+    /// work waiting for a human: Ready-for-Review, refreshing an open pane.
+    fn agent_finished(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
+        match self.approvals.get(&session).cloned() {
+            Some(ApprovalPhase::AwaitingCommit { base }) => {
+                self.commit_turn_finished(session, base)
+            }
+            Some(ApprovalPhase::AwaitingConflictResolution) => self.attempt_merge(session),
+            _ => {
+                self.model.ready_for_review.push(session.clone());
+                let mut effects = vec![Effect::ReadyForReview {
+                    session: session.clone(),
+                }];
+                effects.extend(self.refresh_review(&session));
+                effects
+            }
+        }
+    }
+
+    /// The human Approved: instruct the Agent to commit the changeset on
+    /// its Agent Worktree branch, authoring the commit message itself. The
+    /// session is working again until the commit lands.
+    fn approve_changeset(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
+        let worktree = match self.bound_worktree(&session) {
+            Ok(worktree) => worktree,
+            Err(effect) => return vec![effect],
+        };
+        // The head the commit must move off; unresolvable means the
+        // approval cannot be verified later, so it fails now.
+        let base = match self.git.changeset_base(&worktree) {
+            Ok(base) => base,
+            Err(message) => return vec![Effect::WorktreeOperationFailed { session, message }],
+        };
+        let instructions = format!(
+            "The reviewer approved your changeset. Commit everything in your \
+             worktree on branch '{}' now, in one commit whose message you \
+             author: summarize what the changeset does and why. Do not push.",
+            worktree.branch
+        );
+        self.agent.deliver_instructions(&session, &instructions);
+        self.approvals
+            .insert(session.clone(), ApprovalPhase::AwaitingCommit { base });
+        self.model.ready_for_review.retain(|s| *s != session);
+        vec![Effect::CommitRequested { session }]
+    }
+
+    /// The agent finished after the commit instruction. The commit landed
+    /// when the changeset is clean *and* the branch head moved off `base` —
+    /// a clean tree alone could be the agent wiping its work. Then the
+    /// merge offer opens; anything else voids the approval and puts the
+    /// changeset back in the human's court.
+    fn commit_turn_finished(&mut self, session: AuthoringSessionId, base: String) -> Vec<Effect> {
+        let worktree = match self.bound_worktree(&session) {
+            Ok(worktree) => worktree,
+            Err(effect) => {
+                self.approvals.remove(&session);
+                return vec![effect];
+            }
+        };
+        let committed = match (
+            self.git.changeset_diff(&worktree),
+            self.git.changeset_base(&worktree),
+        ) {
+            (Ok(changeset), Ok(head)) => {
+                if !changeset.files.is_empty() {
+                    Err("the agent finished but the changeset is not committed".to_string())
+                } else if head == base {
+                    Err("the agent finished but no commit landed on the branch".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            (Err(message), _) | (_, Err(message)) => Err(message),
+        };
+        match committed {
+            Ok(()) => {
+                self.approvals
+                    .insert(session.clone(), ApprovalPhase::MergeOffered);
+                self.model.merge_offers.push(session.clone());
+                vec![Effect::MergeOffered {
+                    session,
+                    branch: worktree.branch,
+                }]
+            }
+            Err(message) => {
+                self.approvals.remove(&session);
+                let mut effects = vec![Effect::CommitFailed {
+                    session: session.clone(),
+                    message,
+                }];
+                effects.extend(self.agent_finished(session));
+                effects
+            }
+        }
+    }
+
+    /// Run the merge to the default branch: complete the loop on a clean
+    /// merge, hand conflicts to the agent, keep the offer open on a
+    /// failure. Reached from the accepted offer and again after each
+    /// conflict-resolution turn.
+    fn attempt_merge(&mut self, session: AuthoringSessionId) -> Vec<Effect> {
+        let worktree = match self.bound_worktree(&session) {
+            Ok(worktree) => worktree,
+            Err(effect) => {
+                self.approvals.remove(&session);
+                return vec![effect];
+            }
+        };
+        match self.git.merge_into_default(&worktree) {
+            Ok(MergeOutcome::Merged) => self.complete_merge(session, worktree),
+            Ok(MergeOutcome::Conflicts { files }) => {
+                let instructions = format!(
+                    "Merging your branch '{}' into the default branch hit \
+                     conflicts. A conflicted merge is in progress in your \
+                     worktree, in these files:\n{}\nResolve every conflict, \
+                     then conclude the merge by committing it. Do not push.",
+                    worktree.branch,
+                    files
+                        .iter()
+                        .map(|file| format!("- {file}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                self.agent.deliver_instructions(&session, &instructions);
+                self.approvals
+                    .insert(session.clone(), ApprovalPhase::AwaitingConflictResolution);
+                self.model.merge_offers.retain(|s| *s != session);
+                vec![Effect::MergeConflictsHandedToAgent { session, files }]
+            }
+            Err(message) => vec![Effect::MergeFailed { session, message }],
+        }
+    }
+
+    /// The branch is merged: clean up the Agent Worktree and everything
+    /// keyed by it — the loop is over for this changeset.
+    fn complete_merge(
+        &mut self,
+        session: AuthoringSessionId,
+        worktree: AgentWorktree,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        if let Err(message) = self.git.remove_worktree(&worktree) {
+            effects.push(Effect::WorktreeOperationFailed {
+                session: session.clone(),
+                message,
+            });
+        }
+        self.approvals.remove(&session);
+        self.worktrees.remove(&session);
+        self.reviews.retain(|(s, _)| *s != session);
+        self.marks.remove(&worktree.id);
+        self.annotations.remove(&worktree.id);
+        self.model.ready_for_review.retain(|s| *s != session);
+        self.model.merge_offers.retain(|s| *s != session);
+        effects.push(Effect::MergeCompleted {
+            session,
+            worktree: worktree.id,
+        });
+        effects
     }
 }

@@ -25,6 +25,16 @@ pub trait AgentPort {
     fn spawn_seeded_session(&mut self, seed: &SessionSeed) -> Result<AuthoringSessionId, String>;
 }
 
+/// How an attempted merge to the default branch ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The worktree's branch is merged into the default branch.
+    Merged,
+    /// The merge hit conflicts in these files. The conflicted merge is left
+    /// in progress in the Agent Worktree for the agent to resolve.
+    Conflicts { files: Vec<String> },
+}
+
 /// Git operations on Agent Worktrees. All fallible: real git can refuse any
 /// of these, and the engine surfaces failures as effects.
 pub trait GitPort {
@@ -46,6 +56,15 @@ pub trait GitPort {
     /// The commit the uncommitted changeset sits on — the commit-range key
     /// Annotations are persisted under.
     fn changeset_base(&mut self, worktree: &AgentWorktree) -> Result<String, String>;
+
+    /// Merge the worktree's branch into the default branch. Conflicts are
+    /// not an `Err`: they come back as [`MergeOutcome::Conflicts`], left in
+    /// progress in the worktree for the agent to resolve.
+    fn merge_into_default(&mut self, worktree: &AgentWorktree) -> Result<MergeOutcome, String>;
+
+    /// Remove the worktree and delete its branch — cleanup once the loop is
+    /// over and the branch's work is merged (or explicitly let go).
+    fn remove_worktree(&mut self, worktree: &AgentWorktree) -> Result<(), String>;
 }
 
 /// What the Review Pane should draw. The engine owns this state; the pane
@@ -54,6 +73,9 @@ pub trait GitPort {
 pub struct RenderModel {
     /// Sessions whose changesets are waiting for a human.
     pub ready_for_review: Vec<AuthoringSessionId>,
+    /// Sessions whose approved changesets are committed, each waiting on
+    /// the one-keypress merge offer.
+    pub merge_offers: Vec<AuthoringSessionId>,
     /// The open Review Panes, one view per reviewing session.
     pub reviews: Vec<ReviewView>,
 }

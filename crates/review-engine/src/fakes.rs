@@ -7,7 +7,7 @@ use crate::annotation::Annotation;
 use crate::conversation::SessionSeed;
 use crate::diff::Changeset;
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
-use crate::ports::{AgentPort, GitPort, RenderModel, UiPort};
+use crate::ports::{AgentPort, GitPort, MergeOutcome, RenderModel, UiPort};
 use crate::worktree::AgentWorktree;
 
 /// Scriptable [`AgentPort`]: liveness is set by the test, delivered
@@ -86,8 +86,13 @@ pub struct FakeGitPort {
     existing: HashMap<String, AgentWorktree>,
     created: Vec<AgentWorktree>,
     discarded: Vec<AgentWorktree>,
+    merged: Vec<AgentWorktree>,
+    removed: Vec<AgentWorktree>,
     changeset: Changeset,
     changeset_base: String,
+    /// Scripted outcomes for coming merges, oldest first; an unscripted
+    /// merge succeeds cleanly.
+    merge_outcomes: Vec<MergeOutcome>,
     fail_next: Option<String>,
 }
 
@@ -123,6 +128,21 @@ impl FakeGitPort {
 
     pub fn discarded(&self) -> &[AgentWorktree] {
         &self.discarded
+    }
+
+    /// Worktrees whose branches were merged into the default branch.
+    pub fn merged(&self) -> &[AgentWorktree] {
+        &self.merged
+    }
+
+    /// Worktrees removed (with their branches) after the loop closed.
+    pub fn removed(&self) -> &[AgentWorktree] {
+        &self.removed
+    }
+
+    /// Script the next merge to hit conflicts in these files.
+    pub fn script_merge_conflicts(&mut self, files: Vec<String>) {
+        self.merge_outcomes.push(MergeOutcome::Conflicts { files });
     }
 
     fn scripted_failure(&mut self) -> Option<String> {
@@ -175,6 +195,29 @@ impl GitPort for FakeGitPort {
             return Err(message);
         }
         Ok(self.changeset_base.clone())
+    }
+
+    fn merge_into_default(&mut self, worktree: &AgentWorktree) -> Result<MergeOutcome, String> {
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        if self.merge_outcomes.is_empty() {
+            self.merged.push(worktree.clone());
+            return Ok(MergeOutcome::Merged);
+        }
+        let outcome = self.merge_outcomes.remove(0);
+        if outcome == MergeOutcome::Merged {
+            self.merged.push(worktree.clone());
+        }
+        Ok(outcome)
+    }
+
+    fn remove_worktree(&mut self, worktree: &AgentWorktree) -> Result<(), String> {
+        if let Some(message) = self.scripted_failure() {
+            return Err(message);
+        }
+        self.removed.push(worktree.clone());
+        Ok(())
     }
 }
 

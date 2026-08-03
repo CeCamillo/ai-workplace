@@ -7,7 +7,7 @@ use std::process::Command;
 
 use crate::diff::{parse_unified_diff, Changeset};
 use crate::ids::{AgentWorktreeId, AuthoringSessionId};
-use crate::ports::GitPort;
+use crate::ports::{GitPort, MergeOutcome};
 use crate::worktree::AgentWorktree;
 
 /// Product-managed Agent Worktrees on a real repository (ADR-0004).
@@ -56,6 +56,21 @@ impl SystemGitPort {
             }
         }
         Ok(None)
+    }
+
+    /// The default branch the merge offer targets: the branch checked out
+    /// in the primary working tree.
+    fn default_branch(&self) -> Result<String, String> {
+        let branch = self
+            .git(&self.repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string();
+        if branch == "HEAD" {
+            return Err("the primary working tree is on a detached HEAD, \
+                        so there is no default branch to merge into"
+                .to_string());
+        }
+        Ok(branch)
     }
 
     fn branch_exists(&self, branch: &str) -> bool {
@@ -167,5 +182,48 @@ impl GitPort for SystemGitPort {
             .git(&worktree.path, &["rev-parse", "HEAD"])?
             .trim()
             .to_string())
+    }
+
+    /// Merge in two steps so conflicts stay the agent's job, in the agent's
+    /// own worktree: first merge the default branch into the worktree's
+    /// branch there (conflicts are left in progress and reported), then
+    /// merge the now-up-to-date branch into the default branch in the
+    /// primary working tree, where it cannot conflict.
+    fn merge_into_default(&mut self, worktree: &AgentWorktree) -> Result<MergeOutcome, String> {
+        let default = self.default_branch()?;
+        if default == worktree.branch {
+            return Err(format!(
+                "branch '{}' is the default branch itself",
+                worktree.branch
+            ));
+        }
+        if let Err(message) = self.git(&worktree.path, &["merge", &default]) {
+            let conflicted =
+                self.git(&worktree.path, &["diff", "--name-only", "--diff-filter=U"])?;
+            let files: Vec<String> = conflicted.lines().map(str::to_string).collect();
+            if files.is_empty() {
+                return Err(message);
+            }
+            return Ok(MergeOutcome::Conflicts { files });
+        }
+        self.git(&self.repo_root, &["merge", &worktree.branch])?;
+        Ok(MergeOutcome::Merged)
+    }
+
+    fn remove_worktree(&mut self, worktree: &AgentWorktree) -> Result<(), String> {
+        self.git(
+            &self.repo_root,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                path_to_str(&worktree.path)?,
+            ],
+        )?;
+        // `-D`: the engine only removes after a completed merge (or an
+        // explicit let-go), and cleanup must not stall on git's
+        // merged-into-HEAD bookkeeping.
+        self.git(&self.repo_root, &["branch", "-D", &worktree.branch])?;
+        Ok(())
     }
 }
